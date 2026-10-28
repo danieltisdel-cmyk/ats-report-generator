@@ -397,7 +397,15 @@ with c2:
     accent_color = st.color_picker("Accent Color", "#1a365d")
     include_client_logo = st.checkbox("Add client logo on cover", value=False)
 with c3:
-    images_per_page = st.selectbox("Single photos per page", [2, 4, 6], index=1)
+    photo_layout = st.selectbox(
+        "Regular photo layout",
+        [
+            "ATS — photos stacked, info block beside each",
+            "Grid — 4 per page",
+            "Grid — 6 per page",
+        ],
+        index=0,
+    )
     custom_cover_note = st.text_input("Extra cover note (optional)", "")
 
 client_logo_path = None
@@ -409,16 +417,63 @@ if include_client_logo:
             f.write(client_logo_file.getvalue())
 
 st.markdown("---")
-st.subheader("Images for this report")
-st.caption("Photos that are not a before/after. Select many, or drop a .zip. They print in filename order.")
+st.subheader("Regular inspection")
+st.caption(
+    "One set of photos, not a before/after. They print like the ATS reports: "
+    "two photos down the page, filename under each photo, and Label 1 / Label 2 / Comments beside it."
+)
 
 report_files = st.file_uploader(
-    "Report photos or a .zip",
+    "Inspection photos or a .zip",
     type=["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "zip"],
     accept_multiple_files=True,
     key=f"uploads_{st.session_state.upload_nonce}",
 )
 added_report = add_images(files_from_upload(report_files), role="standard") if report_files else 0
+
+library = st.session_state.library
+regular = [img for img in library if img["role"] == "standard"]
+if regular:
+    st.info(f"{len(regular)} regular inspection photo(s), in filename order.")
+    b1, b2 = st.columns(2)
+    with b1:
+        bulk_l1 = st.text_input("Label 1 for every photo", key="bulk_l1", placeholder="Attemperator")
+    with b2:
+        bulk_l2 = st.text_input("Label 2 for every photo", key="bulk_l2", placeholder="6A MS 546")
+    if st.button("Apply these labels to every regular photo"):
+        for img in regular:
+            if bulk_l1:
+                img["label1"] = bulk_l1
+            if bulk_l2:
+                img["label2"] = bulk_l2
+        st.rerun()
+    if "page_regular" not in st.session_state:
+        st.session_state.page_regular = 0
+    page_size = 6
+    pages = max(1, (len(regular) + page_size - 1) // page_size)
+    page = min(st.session_state.page_regular, pages - 1)
+    st.session_state.page_regular = page
+    for img in regular[page * page_size:(page + 1) * page_size]:
+        with st.expander(img["name"], expanded=False):
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                st.image(img.get("thumb") or img["bytes"], width=200)
+            with c2:
+                img["label1"] = st.text_input("Label 1", value=img.get("label1") or "", key=f"rl1_{img['id']}")
+                img["label2"] = st.text_input("Label 2", value=img.get("label2") or "", key=f"rl2_{img['id']}")
+                img["comments"] = st.text_input("Comments", value=img.get("comments") or "", key=f"rc_{img['id']}")
+    if pages > 1:
+        n1, n2, n3 = st.columns([1, 2, 1])
+        with n1:
+            if st.button("Previous photos", disabled=page <= 0):
+                st.session_state.page_regular -= 1
+                st.rerun()
+        with n2:
+            st.caption(f"Page {page + 1} of {pages}")
+        with n3:
+            if st.button("Next photos", disabled=page >= pages - 1):
+                st.session_state.page_regular += 1
+                st.rerun()
 
 st.markdown("---")
 st.subheader("Before and after — two inspections")
@@ -779,27 +834,27 @@ if st.button("Generate Customized Report PDF", type="primary"):
                 pil = PILImage.open(io.BytesIO(data))
                 if pil.mode not in ("RGB", "L"):
                     pil = pil.convert("RGB")
-                pil.thumbnail((480, 360))
+                pil.thumbnail((1000, 750))
                 pil.save(tmp.name, "JPEG", quality=90)
                 tmp.close()
                 return tmp.name
 
             def make_image_block(data, label1, label2, comments, filename):
                 try:
-                    img = Image(jpeg_path(data), width=3.4*inch, height=2.55*inch)
+                    img = Image(jpeg_path(data), width=4.05*inch, height=3.0*inch)
                 except Exception:
                     img = Paragraph("[Image error]", styles["BodyJust"])
 
                 meta = [
-                    [Paragraph("<b>Label 1</b>", styles["BodyJust"]), Paragraph(label1 or "—", styles["BodyJust"])],
-                    [Paragraph("<b>Label 2</b>", styles["BodyJust"]), Paragraph(label2 or "—", styles["BodyJust"])],
-                    [Paragraph("<b>Comments</b>", styles["BodyJust"]), Paragraph(comments or "—", styles["BodyJust"])],
+                    [Paragraph("<b>Label1</b>", styles["BodyJust"]), Paragraph(label1 or "", styles["BodyJust"])],
+                    [Paragraph("<b>Label2</b>", styles["BodyJust"]), Paragraph(label2 or "", styles["BodyJust"])],
+                    [Paragraph("<b>Comments</b>", styles["BodyJust"]), Paragraph(comments or "", styles["BodyJust"])],
                 ]
-                meta_table = Table(meta, colWidths=[1.0*inch, 1.9*inch])
+                meta_table = Table(meta, colWidths=[0.9*inch, 1.9*inch])
                 meta_table.setStyle(TableStyle([
-                    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cbd5e0")),
-                    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f7fafc")),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("GRID", (0, 0), (-1, -1), 0.4, colors.black),
+                    ("BACKGROUND", (0, 0), (0, -1), colors.white),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                     ("LEFTPADDING", (0, 0), (-1, -1), 4),
                     ("RIGHTPADDING", (0, 0), (-1, -1), 4),
                     ("TOPPADDING", (0, 0), (-1, -1), 3),
@@ -807,19 +862,24 @@ if st.button("Generate Customized Report PDF", type="primary"):
                     ("FONTSIZE", (0, 0), (-1, -1), 8),
                 ]))
 
-                block = Table([[img, meta_table]], colWidths=[3.6*inch, 2.9*inch])
+                block = Table(
+                    [[img, meta_table], [Paragraph(filename, styles["SmallCenter"]), ""]],
+                    colWidths=[4.2*inch, 2.9*inch],
+                )
                 block.setStyle(TableStyle([
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("VALIGN", (0, 0), (1, 0), "TOP"),
+                    ("ALIGN", (0, 1), (0, 1), "CENTER"),
                     ("LEFTPADDING", (0, 0), (-1, -1), 2),
                     ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                    ("TOPPADDING", (0, 0), (-1, -1), 1),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                    ("SPAN", (0, 1), (0, 1)),
                 ]))
-                return KeepTogether([
-                    block,
-                    Paragraph(filename, styles["SmallCenter"]),
-                    Spacer(1, 0.12*inch)
-                ])
+                return KeepTogether([block, Spacer(1, 0.18*inch)])
 
-            pairs_on_page = 1 if images_per_page <= 2 else 2
+            ats_layout = photo_layout.startswith("ATS")
+            images_per_page = 2 if ats_layout else (4 if "4" in photo_layout else 6)
+            pairs_on_page = 1 if ats_layout else 2
             for i, pair in enumerate(ba_pairs):
                 if i > 0 and i % pairs_on_page == 0:
                     story.append(PageBreak())
@@ -858,39 +918,48 @@ if st.button("Generate Customized Report PDF", type="primary"):
             if image_metadata:
                 if ba_pairs:
                     story.append(PageBreak())
-                story.append(Paragraph("<b>Single photos</b>", styles["SectionHead"]))
-                per = images_per_page if images_per_page in (2, 4, 6) else 4
-                img_h = {2: 3.0*inch, 4: 2.25*inch, 6: 1.65*inch}[per]
-                for idx in range(0, len(image_metadata), per):
-                    if idx:
-                        story.append(PageBreak())
-                        story.append(Paragraph("<b>Single photos</b>", styles["SectionHead"]))
-                    chunk = image_metadata[idx:idx + per]
-                    rows = []
-                    for r in range(0, len(chunk), 2):
-                        pics, caps = [], []
-                        for item in chunk[r:r + 2]:
-                            try:
-                                pics.append(Image(jpeg_path(item["bytes"]), width=3.3*inch, height=img_h))
-                            except Exception:
-                                pics.append(Paragraph("[Image error]", styles["BodyJust"]))
-                            tag = item.get("point") or item.get("label1") or ""
-                            caps.append(Paragraph(f"{tag}<br/>{item['name']}", styles["SmallCenter"]))
-                        while len(pics) < 2:
-                            pics.append("")
-                            caps.append("")
-                        rows.append(pics)
-                        rows.append(caps)
-                    grid = Table(rows, colWidths=[3.6*inch, 3.6*inch])
-                    grid.setStyle(TableStyle([
-                        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                        ("LEFTPADDING", (0, 0), (-1, -1), 3),
-                        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-                        ("TOPPADDING", (0, 0), (-1, -1), 2),
-                        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-                    ]))
-                    story.append(grid)
+                if ats_layout:
+                    for idx, item in enumerate(image_metadata):
+                        if idx and idx % 2 == 0:
+                            story.append(PageBreak())
+                        story.append(make_image_block(
+                            item["bytes"], item.get("label1") or "", item.get("label2") or "",
+                            item.get("comments") or "", item["name"],
+                        ))
+                else:
+                    story.append(Paragraph("<b>Single photos</b>", styles["SectionHead"]))
+                    per = images_per_page
+                    img_h = {4: 2.25*inch, 6: 1.65*inch}.get(per, 2.25*inch)
+                    for idx in range(0, len(image_metadata), per):
+                        if idx:
+                            story.append(PageBreak())
+                            story.append(Paragraph("<b>Single photos</b>", styles["SectionHead"]))
+                        chunk = image_metadata[idx:idx + per]
+                        rows = []
+                        for r in range(0, len(chunk), 2):
+                            pics, caps = [], []
+                            for item in chunk[r:r + 2]:
+                                try:
+                                    pics.append(Image(jpeg_path(item["bytes"]), width=3.3*inch, height=img_h))
+                                except Exception:
+                                    pics.append(Paragraph("[Image error]", styles["BodyJust"]))
+                                tag = item.get("point") or item.get("label1") or ""
+                                caps.append(Paragraph(f"{tag}<br/>{item['name']}", styles["SmallCenter"]))
+                            while len(pics) < 2:
+                                pics.append("")
+                                caps.append("")
+                            rows.append(pics)
+                            rows.append(caps)
+                        grid = Table(rows, colWidths=[3.6*inch, 3.6*inch])
+                        grid.setStyle(TableStyle([
+                            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                            ("TOPPADDING", (0, 0), (-1, -1), 2),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                        ]))
+                        story.append(grid)
 
             doc.build(story)
             buffer.seek(0)
