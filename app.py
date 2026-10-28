@@ -239,8 +239,15 @@ def add_images(items, role="standard"):
         })
         known.add((use_role, base))
         added += 1
-    if added and not st.session_state.manual_order:
-        library.sort(key=lambda img: (img["role"], natural_key(img["folder"] + "/" + img["name"])))
+    if added:
+        # Keep this batch in filename order, then place it after photos already loaded.
+        start = len(library) - added
+        batch = library[start:]
+        batch.sort(key=lambda img: natural_key(img["folder"] + "/" + img["name"]))
+        library[start:] = batch
+        for img in batch:
+            img["order"] = st.session_state.next_order
+            st.session_state.next_order += 1
     return added
 
 
@@ -318,6 +325,12 @@ if "seen_uploads" not in st.session_state:
     st.session_state.seen_uploads = set()
 if "manual_order" not in st.session_state:
     st.session_state.manual_order = False
+if "next_order" not in st.session_state:
+    st.session_state.next_order = 0
+for _img in st.session_state.library:
+    if "order" not in _img:
+        _img["order"] = st.session_state.next_order
+        st.session_state.next_order += 1
 if "upload_nonce" not in st.session_state:
     st.session_state.upload_nonce = 0
 if "nonce_before" not in st.session_state:
@@ -420,7 +433,8 @@ st.markdown("---")
 st.subheader("Regular inspection")
 st.caption(
     "One set of photos, not a before/after. They print like the ATS reports: "
-    "two photos down the page, filename under each photo, and Label 1 / Label 2 / Comments beside it."
+    "two photos down the page, filename under each photo, and Label 1 / Label 2 / Comments beside it. "
+    "The next zip or batch you add is placed after the photos already here, not mixed into them."
 )
 
 report_files = st.file_uploader(
@@ -434,7 +448,7 @@ added_report = add_images(files_from_upload(report_files), role="standard") if r
 library = st.session_state.library
 regular = [img for img in library if img["role"] == "standard"]
 if regular:
-    st.info(f"{len(regular)} regular inspection photo(s), in filename order.")
+    st.info(f"{len(regular)} regular inspection photo(s). Each new batch is added after the last one.")
     b1, b2 = st.columns(2)
     with b1:
         bulk_l1 = st.text_input("Label 1 for every photo", key="bulk_l1", placeholder="Attemperator")
@@ -532,6 +546,7 @@ with c3:
         st.session_state.library = []
         st.session_state.seen_uploads = set()
         st.session_state.manual_order = False
+        st.session_state.next_order = 0
         st.session_state.upload_nonce += 1
         st.session_state.nonce_before += 1
         st.session_state.nonce_after += 1
@@ -630,15 +645,106 @@ if library:
 else:
     st.info("No images yet. Add report photos, or the two inspections above.")
 
+def build_docx(meta, images, pairs):
+    """Editable Word copy of the report. Photos keep the same order as the PDF."""
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Inches, Pt
+
+    doc = Document()
+    section = doc.sections[0]
+    section.page_width = Inches(8.5)
+    section.page_height = Inches(11)
+    section.left_margin = Inches(0.6)
+    section.right_margin = Inches(0.6)
+    section.top_margin = Inches(0.7)
+    section.bottom_margin = Inches(0.55)
+
+    def centered(text, size=12, bold=False):
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run(text)
+        run.bold = bold
+        run.font.size = Pt(size)
+        return p
+
+    centered(meta["company"], 16, True)
+    centered(meta["client"], 14, True)
+    if meta.get("site"):
+        centered(meta["site"], 11)
+    centered(meta["title"], 14, True)
+    centered(meta["date"], 11)
+    centered("Prepared By: " + (meta.get("prepared") or ""), 11)
+    for line in (meta.get("address") or "").splitlines():
+        if line.strip():
+            centered(line.strip(), 10)
+
+    for heading, body in (("Scope", meta.get("scope")), ("Access", meta.get("access")), ("Findings", meta.get("findings"))):
+        if (body or "").strip():
+            doc.add_heading(heading, level=2)
+            doc.add_paragraph(body)
+    if meta.get("signoff"):
+        doc.add_heading("Signoff", level=2)
+        doc.add_paragraph(meta["signoff"])
+
+    def photo_row(data, filename, label1, label2, comments):
+        table = doc.add_table(rows=2, cols=2)
+        pic = table.rows[0].cells[0].paragraphs[0].add_run()
+        pic.add_picture(io.BytesIO(data), width=Inches(4.6))
+        name = table.rows[1].cells[0].paragraphs[0]
+        name.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        name.add_run(filename).font.size = Pt(9)
+        cell = table.rows[0].cells[1]
+        lines = (("Label1", label1), ("Label2", label2), ("Comments", comments))
+        first = cell.paragraphs[0]
+        first_run = first.add_run(lines[0][0] + ": ")
+        first_run.bold = True
+        first.add_run(lines[0][1] or "")
+        for key, value in lines[1:]:
+            p = cell.add_paragraph()
+            r = p.add_run(key + ": ")
+            r.bold = True
+            p.add_run(value or "")
+        doc.add_paragraph("")
+
+    if pairs:
+        doc.add_page_break()
+        for pair in pairs:
+            doc.add_heading(str(pair["label"]), level=2)
+            table = doc.add_table(rows=2, cols=2)
+            for col, key, title in ((0, "before_bytes", "BEFORE"), (1, "after_bytes", "AFTER")):
+                head = table.rows[0].cells[col].paragraphs[0]
+                head.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                head.add_run(title).bold = True
+                table.rows[1].cells[col].paragraphs[0].add_run().add_picture(io.BytesIO(pair[key]), width=Inches(3.3))
+            cap = doc.add_paragraph(f"{pair['before_name']}    {pair['after_name']}")
+            cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    for idx, item in enumerate(images):
+        if idx == 0 or idx % 2 == 0:
+            doc.add_page_break()
+        photo_row(
+            item["bytes"], item["name"],
+            item.get("label1") or "", item.get("label2") or "", item.get("comments") or "",
+        )
+
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
 # Generate PDF
-if st.button("Generate Customized Report PDF", type="primary"):
+if st.button("Generate PDF and Word", type="primary"):
     if not client_name or not inspection_title:
         st.error("Please fill in at least Client Name and Inspection Title.")
     else:
         library = st.session_state.library
         paired, left_b, left_a = match_sets(library, "point")
-        image_metadata = [img for img in library if img["role"] == "standard"] + left_b + left_a
-        image_metadata.sort(key=point_sort_key)
+        standards = [img for img in library if img["role"] == "standard"]
+        standards.sort(key=lambda img: img.get("order", 0))
+        leftovers = left_b + left_a
+        leftovers.sort(key=lambda img: img.get("order", 0))
+        image_metadata = standards + leftovers
         ba_pairs = []
         for b, a in paired:
             info = point_info(b) or point_info(a) or {}
@@ -651,7 +757,7 @@ if st.button("Generate Customized Report PDF", type="primary"):
                 "label": label,
                 "comments": " · ".join(x for x in (b.get("comments"), a.get("comments")) if x),
             })
-        with st.spinner("Generating customized report..."):
+        with st.spinner("Generating PDF and Word..."):
             buffer = io.BytesIO()
             accent = colors.HexColor(accent_color)
 
@@ -834,14 +940,23 @@ if st.button("Generate Customized Report PDF", type="primary"):
                 pil = PILImage.open(io.BytesIO(data))
                 if pil.mode not in ("RGB", "L"):
                     pil = pil.convert("RGB")
-                pil.thumbnail((1000, 750))
+                pil.thumbnail((1400, 1050))
                 pil.save(tmp.name, "JPEG", quality=90)
                 tmp.close()
                 return tmp.name
 
             def make_image_block(data, label1, label2, comments, filename):
                 try:
-                    img = Image(jpeg_path(data), width=4.05*inch, height=3.0*inch)
+                    pil = PILImage.open(io.BytesIO(data))
+                    aspect = (pil.width / float(pil.height)) if pil.height else 1.333
+                    max_w, max_h = 4.7*inch, 3.9*inch
+                    if max_w / aspect <= max_h:
+                        draw_w = max_w
+                        draw_h = max_w / aspect
+                    else:
+                        draw_h = max_h
+                        draw_w = max_h * aspect
+                    img = Image(jpeg_path(data), width=draw_w, height=draw_h)
                 except Exception:
                     img = Paragraph("[Image error]", styles["BodyJust"])
 
@@ -850,32 +965,30 @@ if st.button("Generate Customized Report PDF", type="primary"):
                     [Paragraph("<b>Label2</b>", styles["BodyJust"]), Paragraph(label2 or "", styles["BodyJust"])],
                     [Paragraph("<b>Comments</b>", styles["BodyJust"]), Paragraph(comments or "", styles["BodyJust"])],
                 ]
-                meta_table = Table(meta, colWidths=[0.9*inch, 1.9*inch])
+                meta_table = Table(meta, colWidths=[0.85*inch, 1.55*inch])
                 meta_table.setStyle(TableStyle([
                     ("GRID", (0, 0), (-1, -1), 0.4, colors.black),
-                    ("BACKGROUND", (0, 0), (0, -1), colors.white),
                     ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                    ("TOPPADDING", (0, 0), (-1, -1), 3),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
                     ("FONTSIZE", (0, 0), (-1, -1), 8),
                 ]))
 
                 block = Table(
                     [[img, meta_table], [Paragraph(filename, styles["SmallCenter"]), ""]],
-                    colWidths=[4.2*inch, 2.9*inch],
+                    colWidths=[4.85*inch, 2.45*inch],
                 )
                 block.setStyle(TableStyle([
                     ("VALIGN", (0, 0), (1, 0), "TOP"),
                     ("ALIGN", (0, 1), (0, 1), "CENTER"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 2),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 1),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 1),
                     ("TOPPADDING", (0, 0), (-1, -1), 1),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-                    ("SPAN", (0, 1), (0, 1)),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
                 ]))
-                return KeepTogether([block, Spacer(1, 0.18*inch)])
+                return KeepTogether([block, Spacer(1, 0.06*inch)])
 
             ats_layout = photo_layout.startswith("ATS")
             images_per_page = 2 if ats_layout else (4 if "4" in photo_layout else 6)
@@ -964,12 +1077,35 @@ if st.button("Generate Customized Report PDF", type="primary"):
             doc.build(story)
             buffer.seek(0)
 
-            st.success("Customized report generated successfully.")
+            st.success("PDF and Word are ready. The Word file can be edited.")
             st.download_button(
                 label="Download PDF Report",
                 data=buffer,
                 file_name=f"{client_name}_{inspection_title.replace(' ', '_')}_{insp_date.strftime('%Y%m%d')}.pdf",
                 mime="application/pdf"
+            )
+            word_bytes = build_docx(
+                {
+                    "company": company_name,
+                    "client": client_name,
+                    "site": site_location,
+                    "title": inspection_title,
+                    "date": insp_date.strftime("%B %d, %Y"),
+                    "prepared": prepared_by,
+                    "address": company_address,
+                    "scope": scope,
+                    "access": access,
+                    "findings": findings,
+                    "signoff": signoff_name if show_signoff else "",
+                },
+                image_metadata,
+                ba_pairs,
+            )
+            st.download_button(
+                label="Download Word Report",
+                data=word_bytes,
+                file_name=f"{client_name}_{inspection_title.replace(' ', '_')}_{insp_date.strftime('%Y%m%d')}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
 
 st.markdown("---")

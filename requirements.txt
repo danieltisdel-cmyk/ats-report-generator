@@ -2,3 +2,4 @@ streamlit
 reportlab
 pillow
 pytesseract
+python-docx
