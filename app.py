@@ -86,7 +86,7 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
 def natural_key(name):
     parts = re.split(r"(\d+)", (name or "").lower())
-    return [int(p) if p.isdigit() else p for p in parts]
+    return tuple((0, int(p)) if p.isdigit() else (1, p) for p in parts)
 
 
 def detect_role(name):
@@ -174,9 +174,10 @@ def ocr_banner(data):
 
 def point_sort_key(img):
     info = parse_point(img.get("point") or "") or parse_point(img.get("name") or "")
+    name_key = natural_key(img.get("name") or "")
     if not info:
-        return ("zzz", 9999, "", natural_key(img.get("name") or ""))
-    return (info["num"], info["view"], natural_key(img.get("name") or ""))
+        return (1, 0, "", name_key)
+    return (0, int(info["num"]), str(info["view"]), name_key)
 
 
 def add_images(items, role="standard"):
