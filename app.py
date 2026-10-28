@@ -116,23 +116,24 @@ def clean_stem(name):
 
 
 def parse_point(text):
-    """Pen6_0-90_001 and ICI_84_180-270_001 both count. Pen and ICI are the same."""
+    """Only the number after Pen/ICI and the degree range. Pen6_0-90 and ICI_6_0-90 are the same."""
     if not text:
         return None
     m = re.search(
-        r"(?i)(?<![A-Za-z])(pen|ici)[_\-\s]*(\d+)(?:[_\-\s]+(\d{1,3})\s*[-–]\s*(\d{1,3}))?",
+        r"(?i)(?<![A-Za-z])(?:pen|ici)[_\-\s]*(\d+)(?:[_\-\s]+(\d{1,3})\s*[-–]\s*(\d{1,3}))?",
         text,
     )
     if not m:
-        return None
-    kind = "ICI" if m.group(1).lower() == "ici" else "Pen"
-    num = int(m.group(2))
-    if m.group(3) and m.group(4):
-        view = f"{int(m.group(3))}-{int(m.group(4))}"
+        m = re.search(r"(?<!\d)(\d+)\s+(\d{1,3})\s*[-–]\s*(\d{1,3})", text)
+        if not m:
+            return None
+    num = int(m.group(1))
+    if m.group(2) and m.group(3):
+        view = f"{int(m.group(2))}-{int(m.group(3))}"
     else:
         view = ""
-    label = f"{kind} {num}" + (f" {view}" if view else "")
-    return {"kind": kind.lower(), "num": num, "view": view, "label": label}
+    label = f"{num} {view}".strip()
+    return {"num": num, "view": view, "label": label}
 
 
 def is_flag(name):
@@ -185,20 +186,22 @@ def ocr_banner(data):
 
 
 def point_sort_key(img):
-    info = parse_point(img.get("point") or "") or parse_point(img.get("name") or "")
+    info = parse_point(img.get("name") or "") or parse_point(img.get("point") or "")
     name_key = natural_key(img.get("name") or "")
     flagged = 1 if is_flag(img.get("name") or "") else 0
-    if not info:
+    if not info or not info.get("view"):
         return (1, 0, 999, flagged, name_key)
     return (0, int(info["num"]), view_start(info["view"]), flagged, name_key)
 
 
 def point_info(img):
-    """Filename wins, because Mentor names the still Pen6_0-90_001 or ICI_84_180-270_001."""
-    info = parse_point(img.get("name") or "") or parse_point(img.get("point") or "")
-    if info and not parse_point(img.get("point") or ""):
-        img["point"] = info["label"]
-    elif info:
+    """Number and degrees only. Filename first, because it matches the top-left stamp."""
+    info = parse_point(img.get("name") or "")
+    if not info or not info.get("view"):
+        typed = parse_point(img.get("point") or "")
+        if typed and typed.get("view"):
+            info = typed
+    if info and info.get("view"):
         img["point"] = info["label"]
     return info
 
@@ -267,7 +270,7 @@ def match_sets(library, mode="point"):
         info = point_info(a)
         if not info or not info["view"]:
             continue
-        key = (info["num"], info["view"], is_flag(a.get("name")))
+        key = (info["num"], info["view"])
         buckets.setdefault(key, []).append(a)
     used = set()
     pairs = []
@@ -275,7 +278,7 @@ def match_sets(library, mode="point"):
         info = point_info(b)
         if not info or not info["view"]:
             continue
-        key = (info["num"], info["view"], is_flag(b.get("name")))
+        key = (info["num"], info["view"])
         choices = [a for a in buckets.get(key, []) if a["id"] not in used]
         if not choices:
             continue
@@ -421,9 +424,9 @@ st.markdown("---")
 st.subheader("Before and after — two inspections")
 st.caption(
     "Older inspection on the left, the one you just did on the right. "
-    "Pen and ICI are interchangeable. Photos match on the number and the degrees: "
-    "Pen 1 0-90 sits beside ICI 1 0-90. A different degree is a different photo. "
-    "Anything that does not match prints by itself at the end."
+    "Matching uses only the number after Pen or ICI, and the degree range after that. "
+    "Pen6_0-90 matches ICI_6_0-90. The word Pen or ICI does not matter. "
+    "001 and FLAG on the end of the name do not matter. 0-90 does not match 90-180."
 )
 
 col_b, col_a = st.columns(2)
@@ -500,11 +503,13 @@ def edit_set(images, empty_note, page_key):
     start = page * page_size
     for img in images[start:start + page_size]:
         st.image(img.get("thumb") or img["bytes"], width=220, caption=img["name"])
+        shown = (point_info(img) or {}).get("label") or "No number and angle in the name"
+        st.caption(shown)
         img["point"] = st.text_input(
-            "Pen or ICI",
+            "Number and degrees",
             value=img.get("point") or "",
             key=f"pt_{img['id']}",
-            placeholder="Pen 1 0-90",
+            placeholder="6 0-90",
             label_visibility="collapsed",
         )
     if pages > 1:
@@ -521,15 +526,18 @@ def edit_set(images, empty_note, page_key):
 
 if library:
     n_std = sum(1 for img in library if img["role"] == "standard")
-    missing = sum(1 for img in library if img["role"] in ("before", "after") and not (img.get("point") or parse_point(img["name"])))
+    missing = sum(
+        1 for img in library
+        if img["role"] in ("before", "after") and not ((point_info(img) or {}).get("view"))
+    )
     st.info(
         f"Older: {n_before} · This inspection: {n_after} · Other photos: {n_std} · "
         f"Matched pairs: {len(pairs_preview)}"
     )
     if missing:
         st.warning(
-            f"{missing} photo(s) have no Pen or ICI number yet. "
-            "Click the button to read the number printed on the photo, 20 at a time, or type it under the photo."
+            f"{missing} photo(s) have no number and degree range in the filename. "
+            "Those print alone at the end. Type it under the photo as 6 0-90 if the name is wrong."
         )
         if st.button("Read Pen/ICI from the next 20 photos"):
             todo = [img for img in library if img["role"] in ("before", "after") and not img.get("point")][:20]
@@ -578,16 +586,13 @@ if st.button("Generate Customized Report PDF", type="primary"):
         image_metadata.sort(key=point_sort_key)
         ba_pairs = []
         for b, a in paired:
-            info = parse_point(b.get("point") or "") or parse_point(a.get("point") or "") or {}
-            if info:
-                label = f"{info['num']}  {info['view']}".strip()
-            else:
-                label = b.get("point") or a.get("point") or "Before / After"
+            info = point_info(b) or point_info(a) or {}
+            label = info.get("label") or "Before / After"
             ba_pairs.append({
                 "before_bytes": b["bytes"],
                 "after_bytes": a["bytes"],
-                "before_name": b.get("point") or b["name"],
-                "after_name": a.get("point") or a["name"],
+                "before_name": b["name"],
+                "after_name": a["name"],
                 "label": label,
                 "comments": " · ".join(x for x in (b.get("comments"), a.get("comments")) if x),
             })
