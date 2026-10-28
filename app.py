@@ -116,20 +116,32 @@ def clean_stem(name):
 
 
 def parse_point(text):
-    """Pull the Pen or ICI number, and the view after it when present (Pen 1 0-90)."""
+    """Pen6_0-90_001 and ICI_84_180-270_001 both count. Pen and ICI are the same."""
     if not text:
         return None
     m = re.search(
-        r"(?i)\b(pen|ici)\s*[:#_\-]?\s*(\d+)\b(?:\s*(\d{1,3}\s*[-–]\s*\d{1,3}))?",
+        r"(?i)(?<![A-Za-z])(pen|ici)[_\-\s]*(\d+)(?:[_\-\s]+(\d{1,3})\s*[-–]\s*(\d{1,3}))?",
         text,
     )
     if not m:
         return None
     kind = "ICI" if m.group(1).lower() == "ici" else "Pen"
     num = int(m.group(2))
-    view = re.sub(r"\s+", "", m.group(3) or "")
+    if m.group(3) and m.group(4):
+        view = f"{int(m.group(3))}-{int(m.group(4))}"
+    else:
+        view = ""
     label = f"{kind} {num}" + (f" {view}" if view else "")
-    return {"kind": kind.lower(), "num": num, "view": view.lower(), "label": label}
+    return {"kind": kind.lower(), "num": num, "view": view, "label": label}
+
+
+def is_flag(name):
+    return bool(re.search(r"(?i)flag", name or ""))
+
+
+def view_start(view):
+    m = re.match(r"(\d+)", view or "")
+    return int(m.group(1)) if m else 999
 
 
 def read_point(name, data=None):
@@ -175,9 +187,20 @@ def ocr_banner(data):
 def point_sort_key(img):
     info = parse_point(img.get("point") or "") or parse_point(img.get("name") or "")
     name_key = natural_key(img.get("name") or "")
+    flagged = 1 if is_flag(img.get("name") or "") else 0
     if not info:
-        return (1, 0, "", name_key)
-    return (0, int(info["num"]), str(info["view"]), name_key)
+        return (1, 0, 999, flagged, name_key)
+    return (0, int(info["num"]), view_start(info["view"]), flagged, name_key)
+
+
+def point_info(img):
+    """Filename wins, because Mentor names the still Pen6_0-90_001 or ICI_84_180-270_001."""
+    info = parse_point(img.get("name") or "") or parse_point(img.get("point") or "")
+    if info and not parse_point(img.get("point") or ""):
+        img["point"] = info["label"]
+    elif info:
+        img["point"] = info["label"]
+    return info
 
 
 def add_images(items, role="standard"):
@@ -232,23 +255,28 @@ def images_from_zip(data):
 
 
 def match_sets(library, mode="point"):
-    """Pen and ICI are the same. Match the number and the degrees: Pen 1 0-90 with ICI 1 0-90."""
+    """Pen and ICI match on the number and the degree range. Pen6_0-90 pairs with ICI_6_0-90."""
+    for img in library:
+        point_info(img)
     befores = [img for img in library if img["role"] == "before"]
     afters = [img for img in library if img["role"] == "after"]
     befores.sort(key=point_sort_key)
     afters.sort(key=point_sort_key)
     buckets = {}
     for a in afters:
-        info = parse_point(a.get("point") or "") or parse_point(a.get("name") or "")
-        key = (info["num"], info["view"]) if info else None
+        info = point_info(a)
+        if not info or not info["view"]:
+            continue
+        key = (info["num"], info["view"], is_flag(a.get("name")))
         buckets.setdefault(key, []).append(a)
     used = set()
     pairs = []
     for b in befores:
-        info = parse_point(b.get("point") or "") or parse_point(b.get("name") or "")
-        if not info:
+        info = point_info(b)
+        if not info or not info["view"]:
             continue
-        choices = [a for a in buckets.get((info["num"], info["view"]), []) if a["id"] not in used]
+        key = (info["num"], info["view"], is_flag(b.get("name")))
+        choices = [a for a in buckets.get(key, []) if a["id"] not in used]
         if not choices:
             continue
         chosen = choices[0]
