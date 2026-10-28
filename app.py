@@ -115,10 +115,50 @@ def clean_stem(name):
     return re.sub(r"\s+", " ", stem).strip()
 
 
-def last_number(name):
-    stem = re.sub(r"\b(19|20)\d{2}\b", " ", os.path.splitext(os.path.basename(name or ""))[0])
-    nums = re.findall(r"\d+", stem)
-    return int(nums[-1]) if nums else None
+def parse_point(text):
+    """Pull the Pen or ICI number, and the view after it when present (Pen 1 0-90)."""
+    if not text:
+        return None
+    m = re.search(
+        r"(?i)\b(pen|ici)\s*[:#_\-]?\s*(\d+)\b(?:\s*(\d{1,3}\s*[-–]\s*\d{1,3}))?",
+        text,
+    )
+    if not m:
+        return None
+    kind = "ICI" if m.group(1).lower() == "ici" else "Pen"
+    num = int(m.group(2))
+    view = re.sub(r"\s+", "", m.group(3) or "")
+    label = f"{kind} {num}" + (f" {view}" if view else "")
+    return {"kind": kind.lower(), "num": num, "view": view.lower(), "label": label}
+
+
+def read_point(name, data):
+    found = parse_point(name)
+    if found:
+        return found["label"]
+    try:
+        import pytesseract
+        im = PILImage.open(io.BytesIO(data)).convert("RGB")
+        w, h = im.size
+        crops = [
+            im.crop((0, 0, w, max(20, int(h * 0.14)))),
+            im.crop((0, 0, int(w * 0.5), max(20, int(h * 0.2)))),
+        ]
+        bits = []
+        for crop in crops:
+            crop = crop.resize((crop.width * 3, crop.height * 3))
+            bits.append(pytesseract.image_to_string(crop, config="--psm 6") or "")
+        found = parse_point(" ".join(bits))
+        return found["label"] if found else ""
+    except Exception:
+        return ""
+
+
+def point_sort_key(img):
+    info = parse_point(img.get("point") or "") or parse_point(img.get("name") or "")
+    if not info:
+        return ("zzz", 9999, "", natural_key(img.get("name") or ""))
+    return (info["kind"], info["num"], info["view"], natural_key(img.get("name") or ""))
 
 
 def add_images(items, role="standard"):
@@ -143,6 +183,7 @@ def add_images(items, role="standard"):
             "label2": "",
             "comments": "",
             "role": use_role,
+            "point": read_point(base, data),
         })
         known.add((use_role, base, len(data)))
         added += 1
@@ -164,43 +205,38 @@ def images_from_zip(data):
     return found
 
 
-def match_sets(library, mode):
-    """Pair the older inspection (before) with this inspection (after)."""
+def match_sets(library, mode="point"):
+    """Pair older photos to new photos that share the same Pen or ICI number."""
     befores = [img for img in library if img["role"] == "before"]
     afters = [img for img in library if img["role"] == "after"]
-    befores.sort(key=lambda img: natural_key(img["name"]))
-    afters.sort(key=lambda img: natural_key(img["name"]))
+    befores.sort(key=point_sort_key)
+    afters.sort(key=point_sort_key)
+    buckets = {}
+    for a in afters:
+        info = parse_point(a.get("point") or "") or parse_point(a.get("name") or "")
+        key = (info["kind"], info["num"]) if info else None
+        buckets.setdefault(key, []).append(a)
     used = set()
     pairs = []
-
-    def take(after_img):
-        used.add(after_img["id"])
-        return after_img
-
-    if mode == "order":
-        for b, a in zip(befores, afters):
-            pairs.append((b, take(a)))
-    else:
-        if mode == "number":
-            buckets = {}
-            for a in afters:
-                buckets.setdefault(last_number(a["name"]), []).append(a)
-            def key_of(img):
-                return last_number(img["name"])
-        else:
-            buckets = {}
-            for a in afters:
-                buckets.setdefault(clean_stem(a["name"]), []).append(a)
-            def key_of(img):
-                return clean_stem(img["name"])
-        for b in befores:
-            choices = [a for a in buckets.get(key_of(b), []) if a["id"] not in used]
-            if choices:
-                pairs.append((b, take(choices[0])))
+    for b in befores:
+        info = parse_point(b.get("point") or "") or parse_point(b.get("name") or "")
+        if not info:
+            continue
+        choices = [a for a in buckets.get((info["kind"], info["num"]), []) if a["id"] not in used]
+        if not choices:
+            continue
+        if info["view"]:
+            exact = [a for a in choices if (parse_point(a.get("point") or "") or {}).get("view") == info["view"]]
+            if exact:
+                choices = exact
+        chosen = choices[0]
+        used.add(chosen["id"])
+        pairs.append((b, chosen))
     paired_b = {b["id"] for b, _ in pairs}
     paired_a = {a["id"] for _, a in pairs}
     left_b = [b for b in befores if b["id"] not in paired_b]
     left_a = [a for a in afters if a["id"] not in paired_a]
+    pairs.sort(key=lambda pair: point_sort_key(pair[0]))
     return pairs, left_b, left_a
 
 
@@ -297,7 +333,7 @@ with c2:
     accent_color = st.color_picker("Accent Color", "#1a365d")
     include_client_logo = st.checkbox("Add client logo on cover", value=False)
 with c3:
-    images_per_page = st.selectbox("Images per page", [1, 2], index=1)
+    images_per_page = st.selectbox("Single photos per page", [2, 4, 6], index=1)
     custom_cover_note = st.text_input("Extra cover note (optional)", "")
 
 client_logo_path = None
@@ -323,8 +359,9 @@ added_report = add_images(files_from_upload(report_files), role="standard") if r
 st.markdown("---")
 st.subheader("Before and after — two inspections")
 st.caption(
-    "Put the older inspection on the left and the one you just did on the right. "
-    "Each box takes a whole set of photos or a .zip. They are matched across the two sets, not mixed into one list."
+    "Older inspection on the left, the one you just did on the right. "
+    "They stay separate. A before photo is matched to an after photo only when both say the same Pen or ICI number "
+    "(Pen 1 with Pen 1, ICI 4 with ICI 4). Photos with no match print by themselves at the end."
 )
 
 col_b, col_a = st.columns(2)
@@ -355,24 +392,7 @@ if added_report:
 library = st.session_state.library
 n_before = sum(1 for img in library if img["role"] == "before")
 n_after = sum(1 for img in library if img["role"] == "after")
-
-if "match_mode" not in st.session_state:
-    st.session_state.match_mode = "name"
-
-if n_before and n_after:
-    match_mode = st.radio(
-        "Line the two inspections up by",
-        ["name", "number", "order"],
-        format_func=lambda m: {
-            "name": "Same name (years and dates ignored)",
-            "number": "Same number in the filename",
-            "order": "Same order — 1st with 1st, 2nd with 2nd",
-        }[m],
-        horizontal=True,
-        key="match_mode",
-    )
-else:
-    match_mode = st.session_state.match_mode
+match_mode = "point"
 
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -404,68 +424,52 @@ role_labels = {
 
 pairs_preview, left_before, left_after = match_sets(library, match_mode)
 
+def edit_set(images, empty_note):
+    if not images:
+        st.caption(empty_note)
+        return
+    for img in images:
+        tag = img.get("point") or "No Pen / ICI yet"
+        st.image(img["bytes"], width=240, caption=img["name"])
+        img["point"] = st.text_input(
+            "Pen or ICI",
+            value=img.get("point") or "",
+            key=f"pt_{img['id']}",
+            placeholder="Pen 1 or ICI 3",
+            label_visibility="collapsed",
+        )
+        st.caption(tag if img.get("point") else "Type the Pen or ICI number if it was not picked up.")
+
 if library:
     n_std = sum(1 for img in library if img["role"] == "standard")
+    missing = sum(1 for img in library if img["role"] in ("before", "after") and not (img.get("point") or parse_point(img["name"])))
     st.info(
         f"Older: {n_before} · This inspection: {n_after} · Other photos: {n_std} · "
-        f"Side-by-side pairs: {len(pairs_preview)}"
+        f"Matched pairs: {len(pairs_preview)}"
     )
-    if n_before and n_after and (left_before or left_after):
+    if missing:
         st.warning(
-            f"{len(left_before)} older photo(s) and {len(left_after)} new photo(s) did not line up. "
-            "Try another match option above. Unmatched photos print by themselves."
+            f"{missing} photo(s) have no Pen or ICI number. Type it under the photo (example: Pen 1). "
+            "Those print alone at the end until they match."
         )
 
+    left_col, right_col = st.columns(2)
+    with left_col:
+        st.markdown(f"**Older inspection ({n_before})**")
+        edit_set(sorted((img for img in library if img["role"] == "before"), key=point_sort_key), "No older photos yet.")
+    with right_col:
+        st.markdown(f"**This inspection ({n_after})**")
+        edit_set(sorted((img for img in library if img["role"] == "after"), key=point_sort_key), "No new photos yet.")
+
     if pairs_preview:
-        st.markdown("**How they will sit on the page**")
-        for n, (b, a) in enumerate(pairs_preview[:8], start=1):
-            p1, p2 = st.columns(2)
-            with p1:
-                st.image(b["bytes"], width=260, caption=f"Before {n}: {b['name']}")
-            with p2:
-                st.image(a["bytes"], width=260, caption=f"After {n}: {a['name']}")
-        if len(pairs_preview) > 8:
-            st.caption(f"Plus {len(pairs_preview) - 8} more pairs.")
-
-    query = st.text_input("Find an image", placeholder="Type part of a filename")
-    shown = [img for img in library if not query or query.lower() in img["name"].lower()]
-
-    page_size = 12
-    pages = max(1, (len(shown) + page_size - 1) // page_size)
-    st.session_state.img_page = min(st.session_state.img_page, pages - 1)
-    nav1, nav2, nav3 = st.columns([1, 2, 1])
-    with nav1:
-        if st.button("Previous page", disabled=st.session_state.img_page <= 0):
-            st.session_state.img_page -= 1
-            st.rerun()
-    with nav2:
-        st.markdown(f"Page {st.session_state.img_page + 1} of {pages}")
-    with nav3:
-        if st.button("Next page", disabled=st.session_state.img_page >= pages - 1):
-            st.session_state.img_page += 1
-            st.rerun()
-
-    start = st.session_state.img_page * page_size
-    for img in shown[start:start + page_size]:
-        idx = library.index(img)
-        with st.expander(f"{role_labels.get(img['role'], img['role'])}: {img['name']}", expanded=False):
-            left, right = st.columns([1, 2])
-            with left:
-                st.image(img["bytes"], width=220)
-            with right:
-                img["role"] = st.selectbox(
-                    "Use as",
-                    list(role_labels.keys()),
-                    index=list(role_labels.keys()).index(img["role"]) if img["role"] in role_labels else 0,
-                    format_func=lambda r: role_labels[r],
-                    key=f"role_{img['id']}",
-                )
-                img["label1"] = st.text_input("Label 1", value=img["label1"], key=f"l1_{img['id']}")
-                img["label2"] = st.text_input("Label 2", value=img["label2"], key=f"l2_{img['id']}")
-                img["comments"] = st.text_input("Comments", value=img["comments"], key=f"c_{img['id']}")
-                if st.button("Remove", key=f"rm_{img['id']}"):
-                    library.pop(idx)
-                    st.rerun()
+        st.markdown("**Matched by Pen / ICI**")
+        for b, a in pairs_preview:
+            label = b.get("point") or a.get("point") or "Pair"
+            st.write(f"{label}:  {b['name']}  ↔  {a['name']}")
+    singles = [img for img in library if img["role"] == "standard"] + left_before + left_after
+    if singles:
+        st.markdown("**Single photos — these print at the end**")
+        st.write(", ".join((img.get("point") or img["name"]) for img in singles[:30]))
 else:
     st.info("No images yet. Add report photos, or the two inspections above.")
 
@@ -475,13 +479,9 @@ if st.button("Generate Customized Report PDF", type="primary"):
         st.error("Please fill in at least Client Name and Inspection Title.")
     else:
         library = st.session_state.library
-        mode = st.session_state.get("match_mode", "name")
-        paired, left_b, left_a = match_sets(library, mode)
-        paired_ids = {b["id"] for b, _a in paired} | {a["id"] for _b, a in paired}
-        image_metadata = [
-            img for img in library
-            if img["role"] == "standard" or (img["id"] not in paired_ids and img["role"] in ("before", "after"))
-        ]
+        paired, left_b, left_a = match_sets(library, "point")
+        image_metadata = [img for img in library if img["role"] == "standard"] + left_b + left_a
+        image_metadata.sort(key=point_sort_key)
         ba_pairs = []
         for b, a in paired:
             ba_pairs.append({
@@ -489,8 +489,8 @@ if st.button("Generate Customized Report PDF", type="primary"):
                 "after_bytes": a["bytes"],
                 "before_name": b["name"],
                 "after_name": a["name"],
-                "label": b["label1"] or clean_stem(b["name"]) or "Before / After",
-                "comments": " · ".join(x for x in (b["comments"], a["comments"]) if x),
+                "label": b.get("point") or a.get("point") or "Before / After",
+                "comments": " · ".join(x for x in (b.get("comments"), a.get("comments")) if x),
             })
         with st.spinner("Generating customized report..."):
             buffer = io.BytesIO()
@@ -715,30 +715,20 @@ if st.button("Generate Customized Report PDF", type="primary"):
                     Spacer(1, 0.12*inch)
                 ])
 
-            step = images_per_page
-            wrote_std = False
-            for idx in range(0, len(image_metadata), step):
-                wrote_std = True
-                chunk = image_metadata[idx:idx+step]
-                for item in chunk:
-                    story.append(make_image_block(
-                        item["bytes"], item["label1"], item["label2"], item["comments"], item["name"]
-                    ))
-                if idx + step < len(image_metadata):
-                    story.append(PageBreak())
-
+            pairs_on_page = 1 if images_per_page <= 2 else 2
             for i, pair in enumerate(ba_pairs):
-                if wrote_std or i > 0:
+                if i > 0 and i % pairs_on_page == 0:
                     story.append(PageBreak())
                 story.append(Paragraph(f"<b>{pair['label']}</b>", styles["SectionHead"]))
                 story.append(Paragraph(
                     f"{pair['before_name']}  ·  {pair['after_name']}",
                     styles["SmallCenter"],
                 ))
-                story.append(Spacer(1, 0.08*inch))
+                story.append(Spacer(1, 0.06*inch))
+                pair_h = 2.5*inch if pairs_on_page == 1 else 2.05*inch
                 try:
-                    img_b = Image(jpeg_path(pair["before_bytes"]), width=3.3*inch, height=2.5*inch)
-                    img_a = Image(jpeg_path(pair["after_bytes"]), width=3.3*inch, height=2.5*inch)
+                    img_b = Image(jpeg_path(pair["before_bytes"]), width=3.3*inch, height=pair_h)
+                    img_a = Image(jpeg_path(pair["after_bytes"]), width=3.3*inch, height=pair_h)
                 except Exception:
                     img_b = Paragraph("Before", styles["BodyJust"])
                     img_a = Paragraph("After", styles["BodyJust"])
@@ -752,13 +742,51 @@ if st.button("Generate Customized Report PDF", type="primary"):
                     ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                     ("BOX", (0, 0), (-1, -1), 1, colors.HexColor("#cbd5e0")),
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
-                    ("TOPPADDING", (0, 0), (-1, 0), 6),
-                    ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+                    ("TOPPADDING", (0, 0), (-1, 0), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
                 ]))
                 story.append(ba_table)
                 if pair["comments"]:
-                    story.append(Spacer(1, 0.1*inch))
+                    story.append(Spacer(1, 0.06*inch))
                     story.append(Paragraph(f"<b>Comments:</b> {pair['comments']}", styles["BodyJust"]))
+                story.append(Spacer(1, 0.12*inch))
+
+            if image_metadata:
+                if ba_pairs:
+                    story.append(PageBreak())
+                story.append(Paragraph("<b>Single photos</b>", styles["SectionHead"]))
+                per = images_per_page if images_per_page in (2, 4, 6) else 4
+                img_h = {2: 3.0*inch, 4: 2.25*inch, 6: 1.65*inch}[per]
+                for idx in range(0, len(image_metadata), per):
+                    if idx:
+                        story.append(PageBreak())
+                        story.append(Paragraph("<b>Single photos</b>", styles["SectionHead"]))
+                    chunk = image_metadata[idx:idx + per]
+                    rows = []
+                    for r in range(0, len(chunk), 2):
+                        pics, caps = [], []
+                        for item in chunk[r:r + 2]:
+                            try:
+                                pics.append(Image(jpeg_path(item["bytes"]), width=3.3*inch, height=img_h))
+                            except Exception:
+                                pics.append(Paragraph("[Image error]", styles["BodyJust"]))
+                            tag = item.get("point") or item.get("label1") or ""
+                            caps.append(Paragraph(f"{tag}<br/>{item['name']}", styles["SmallCenter"]))
+                        while len(pics) < 2:
+                            pics.append("")
+                            caps.append("")
+                        rows.append(pics)
+                        rows.append(caps)
+                    grid = Table(rows, colWidths=[3.6*inch, 3.6*inch])
+                    grid.setStyle(TableStyle([
+                        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                        ("TOPPADDING", (0, 0), (-1, -1), 2),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                    ]))
+                    story.append(grid)
 
             doc.build(story)
             buffer.seek(0)
