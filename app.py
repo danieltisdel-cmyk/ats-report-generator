@@ -1,6 +1,9 @@
 import streamlit as st
 import io
 import json
+import re
+import uuid
+import zipfile
 from datetime import date
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
@@ -77,6 +80,102 @@ def ensure_default_logo():
 
 
 ensure_default_logo()
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+def natural_key(name):
+    parts = re.split(r"(\d+)", (name or "").lower())
+    return [int(p) if p.isdigit() else p for p in parts]
+
+
+def detect_role(name):
+    n = (name or "").lower()
+    if re.search(r"(before|pre[_\-\s]?shot|\bpre\b|_bef\b|_b4\b)", n):
+        return "before"
+    if re.search(r"(after|post[_\-\s]?shot|\bpost\b|_aft\b)", n):
+        return "after"
+    return "standard"
+
+
+def pair_key(name):
+    stem = os.path.splitext(os.path.basename(name or ""))[0]
+    stem = re.sub(r"(?i)[\s_\-]*(before|after|pre|post|bef|aft|b4)\b", " ", stem)
+    stem = re.sub(r"\s+", " ", stem).strip(" _-").lower()
+    return stem
+
+
+def add_images(items):
+    """items: list of (name, bytes). Skips duplicates and non-images."""
+    library = st.session_state.library
+    known = {(img["name"], len(img["bytes"])) for img in library}
+    added = 0
+    for name, data in items:
+        base = os.path.basename(name.replace("\\", "/"))
+        ext = os.path.splitext(base)[1].lower()
+        if ext not in IMAGE_EXTS or not data:
+            continue
+        if (base, len(data)) in known:
+            continue
+        library.append({
+            "id": uuid.uuid4().hex[:10],
+            "name": base,
+            "folder": os.path.dirname(name.replace("\\", "/")),
+            "bytes": data,
+            "label1": os.path.splitext(base)[0],
+            "label2": "",
+            "comments": "",
+            "role": detect_role(base),
+        })
+        known.add((base, len(data)))
+        added += 1
+    if added and not st.session_state.manual_order:
+        library.sort(key=lambda img: natural_key(img["folder"] + "/" + img["name"]))
+    return added
+
+
+def images_from_zip(data):
+    found = []
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        return found
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        found.append((info.filename, zf.read(info)))
+    return found
+
+
+def build_pairs(library):
+    befores = [img for img in library if img["role"] == "before"]
+    afters = [img for img in library if img["role"] == "after"]
+    used_after = set()
+    pairs = []
+    for b in befores:
+        key = pair_key(b["name"])
+        match = next((a for a in afters if a["id"] not in used_after and pair_key(a["name"]) == key), None)
+        if match is None:
+            bnums = re.findall(r"\d+", b["name"])
+            if bnums:
+                match = next(
+                    (a for a in afters if a["id"] not in used_after and bnums[-1] in re.findall(r"\d+", a["name"])),
+                    None,
+                )
+        if match is not None:
+            used_after.add(match["id"])
+            pairs.append((b, match))
+    return pairs
+
+
+if "library" not in st.session_state:
+    st.session_state.library = []
+if "manual_order" not in st.session_state:
+    st.session_state.manual_order = False
+if "upload_nonce" not in st.session_state:
+    st.session_state.upload_nonce = 0
+if "img_page" not in st.session_state:
+    st.session_state.img_page = 0
 
 # Initialize session state for presets
 if "presets" not in st.session_state:
@@ -161,61 +260,148 @@ if include_client_logo:
 
 st.markdown("---")
 st.subheader("Images")
+st.caption("Drop a whole folder as a .zip, or select many photos at once. They sort by the numbers in the filename (2 before 10) and stay in that order.")
 
-st.markdown("**Standard Inspection Images**")
-uploaded_images = st.file_uploader(
-    "Upload images (JPG/PNG from Mentor MVIQ, phone, or other sources)",
-    type=["jpg", "jpeg", "png"],
-    accept_multiple_files=True,
-    key="std_images"
-)
+up1, up2 = st.columns(2)
+with up1:
+    uploaded_images = st.file_uploader(
+        "Images — select as many as you want",
+        type=["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff"],
+        accept_multiple_files=True,
+        key=f"std_images_{st.session_state.upload_nonce}",
+    )
+with up2:
+    uploaded_zips = st.file_uploader(
+        "Or a .zip of the whole folder",
+        type=["zip"],
+        accept_multiple_files=True,
+        key=f"zip_images_{st.session_state.upload_nonce}",
+    )
 
-image_metadata = []
+incoming = []
 if uploaded_images:
-    st.info(f"{len(uploaded_images)} image(s) uploaded. Expand each to add labels and comments.")
-    for i, img_file in enumerate(uploaded_images):
-        with st.expander(f"Image {i+1}: {img_file.name}", expanded=False):
-            c1, c2 = st.columns(2)
-            with c1:
-                label1 = st.text_input("Label 1", value="Component", key=f"l1_{i}")
-                label2 = st.text_input("Label 2", value="", key=f"l2_{i}")
-            with c2:
-                comments = st.text_input("Comments", value="", key=f"c_{i}")
-            image_metadata.append({
-                "file": img_file,
-                "name": img_file.name,
-                "label1": label1,
-                "label2": label2,
-                "comments": comments,
-            })
+    incoming.extend((f.name, f.getvalue()) for f in uploaded_images)
+if uploaded_zips:
+    for z in uploaded_zips:
+        incoming.extend(images_from_zip(z.getvalue()))
+if incoming:
+    added = add_images(incoming)
+    if added:
+        st.session_state.img_page = 0
 
-st.markdown("**Before / After Image Pairs** (optional)")
-include_ba = st.checkbox("Include before/after pairs (displayed side-by-side)")
-ba_pairs = []
-if include_ba:
-    num_pairs = st.number_input("Number of before/after pairs", min_value=1, max_value=10, value=1)
-    for p in range(num_pairs):
-        st.markdown(f"**Pair {p+1}**")
-        bc1, bc2 = st.columns(2)
-        with bc1:
-            before_file = st.file_uploader(f"Before image {p+1}", type=["jpg", "jpeg", "png"], key=f"before_{p}")
-        with bc2:
-            after_file = st.file_uploader(f"After image {p+1}", type=["jpg", "jpeg", "png"], key=f"after_{p}")
-        if before_file and after_file:
-            pair_label = st.text_input(f"Pair {p+1} label / description", value=f"Before/After Pair {p+1}", key=f"pair_label_{p}")
-            pair_comments = st.text_input(f"Pair {p+1} comments", value="", key=f"pair_c_{p}")
-            ba_pairs.append({
-                "before": before_file,
-                "after": after_file,
-                "label": pair_label,
-                "comments": pair_comments
-            })
+library = st.session_state.library
+b1, b2, b3, b4 = st.columns(4)
+with b1:
+    if st.button("Sort by filename"):
+        library.sort(key=lambda img: natural_key(img["folder"] + "/" + img["name"]))
+        st.session_state.manual_order = False
+        st.rerun()
+with b2:
+    if st.button("Tag before/after from names"):
+        for img in library:
+            img["role"] = detect_role(img["name"])
+        st.rerun()
+with b3:
+    if st.button("Mark all standard"):
+        for img in library:
+            img["role"] = "standard"
+        st.rerun()
+with b4:
+    if st.button("Clear all images"):
+        st.session_state.library = []
+        st.session_state.manual_order = False
+        st.session_state.upload_nonce += 1
+        st.session_state.img_page = 0
+        st.rerun()
+
+role_labels = {
+    "standard": "In report",
+    "before": "Before",
+    "after": "After",
+    "skip": "Leave out",
+}
+
+if library:
+    n_std = sum(1 for img in library if img["role"] == "standard")
+    pairs_preview = build_pairs(library)
+    st.info(f"{len(library)} images loaded · {n_std} in order · {len(pairs_preview)} before/after pair(s).")
+
+    query = st.text_input("Find an image", placeholder="Type part of a filename")
+    shown = [img for img in library if not query or query.lower() in img["name"].lower() or query.lower() in (img.get("folder") or "").lower()]
+
+    page_size = 12
+    pages = max(1, (len(shown) + page_size - 1) // page_size)
+    st.session_state.img_page = min(st.session_state.img_page, pages - 1)
+    nav1, nav2, nav3 = st.columns([1, 2, 1])
+    with nav1:
+        if st.button("Previous page", disabled=st.session_state.img_page <= 0):
+            st.session_state.img_page -= 1
+            st.rerun()
+    with nav2:
+        st.markdown(f"Page {st.session_state.img_page + 1} of {pages}")
+    with nav3:
+        if st.button("Next page", disabled=st.session_state.img_page >= pages - 1):
+            st.session_state.img_page += 1
+            st.rerun()
+
+    start = st.session_state.img_page * page_size
+    for offset, img in enumerate(shown[start:start + page_size]):
+        idx = library.index(img)
+        with st.expander(f"{idx + 1}. {img['name']}  —  {role_labels.get(img['role'], img['role'])}", expanded=False):
+            left, right = st.columns([1, 2])
+            with left:
+                st.image(img["bytes"], width=220)
+            with right:
+                img["role"] = st.selectbox(
+                    "Use as",
+                    list(role_labels.keys()),
+                    index=list(role_labels.keys()).index(img["role"]) if img["role"] in role_labels else 0,
+                    format_func=lambda r: role_labels[r],
+                    key=f"role_{img['id']}",
+                )
+                img["label1"] = st.text_input("Label 1", value=img["label1"], key=f"l1_{img['id']}")
+                img["label2"] = st.text_input("Label 2", value=img["label2"], key=f"l2_{img['id']}")
+                img["comments"] = st.text_input("Comments", value=img["comments"], key=f"c_{img['id']}")
+                m1, m2, m3 = st.columns(3)
+                with m1:
+                    if st.button("Move up", key=f"up_{img['id']}", disabled=idx == 0):
+                        library[idx - 1], library[idx] = library[idx], library[idx - 1]
+                        st.session_state.manual_order = True
+                        st.rerun()
+                with m2:
+                    if st.button("Move down", key=f"dn_{img['id']}", disabled=idx >= len(library) - 1):
+                        library[idx + 1], library[idx] = library[idx], library[idx + 1]
+                        st.session_state.manual_order = True
+                        st.rerun()
+                with m3:
+                    if st.button("Remove", key=f"rm_{img['id']}"):
+                        library.pop(idx)
+                        st.rerun()
+
+    if pairs_preview:
+        st.markdown("**Before/after pairs that will sit side by side**")
+        for b, a in pairs_preview:
+            st.write(f"{b['name']}  →  {a['name']}")
+else:
+    st.info("No images yet. Select a batch of photos, or zip the Mentor folder and upload the .zip.")
 
 # Generate PDF
 if st.button("Generate Customized Report PDF", type="primary"):
     if not client_name or not inspection_title:
         st.error("Please fill in at least Client Name and Inspection Title.")
     else:
+        library = st.session_state.library
+        image_metadata = [img for img in library if img["role"] == "standard"]
+        ba_pairs = []
+        for b, a in build_pairs(library):
+            ba_pairs.append({
+                "before_bytes": b["bytes"],
+                "after_bytes": a["bytes"],
+                "before_name": b["name"],
+                "after_name": a["name"],
+                "label": b["label1"] or pair_key(b["name"]) or "Before / After",
+                "comments": " · ".join(x for x in (b["comments"], a["comments"]) if x),
+            })
         with st.spinner("Generating customized report..."):
             buffer = io.BytesIO()
             accent = colors.HexColor(accent_color)
@@ -311,11 +497,27 @@ if st.button("Generate Customized Report PDF", type="primary"):
             story.append(Paragraph(company_address.replace("\n", "<br/>"), styles["SmallCenter"]))
             story.append(PageBreak())
 
-            # Boxed sections
+            # Boxed sections — skip blanks, one column so the text is not dropped
+            box_title = ParagraphStyle(
+                "BoxTitle",
+                parent=styles["Normal"],
+                fontName="Helvetica-Bold",
+                fontSize=11,
+                textColor=accent,
+                leading=14,
+                spaceBefore=0,
+                spaceAfter=0,
+            )
+
             def boxed_section(title, content):
-                data = [[Paragraph(f"<b>{title}</b>", styles["SectionHead"]), ""],
-                        [Paragraph(content, styles["BodyJust"]), ""]]
-                t = Table(data, colWidths=[6.3*inch])
+                text = (content or "").strip()
+                if not text:
+                    return None
+                data = [
+                    [Paragraph(title, box_title)],
+                    [Paragraph(text.replace("\n", "<br/>"), styles["BodyJust"])],
+                ]
+                t = Table(data, colWidths=[7.2*inch])
                 t.setStyle(TableStyle([
                     ("BOX", (0, 0), (-1, -1), 1, colors.HexColor("#cbd5e0")),
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf2f7")),
@@ -324,20 +526,17 @@ if st.button("Generate Customized Report PDF", type="primary"):
                     ("TOPPADDING", (0, 0), (-1, -1), 6),
                     ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("SPAN", (0, 0), (-1, 0)),
-                    ("SPAN", (0, 1), (-1, 1)),
                 ]))
                 return t
 
-            story.append(boxed_section("Scope", scope))
-            story.append(Spacer(1, 0.12*inch))
-            story.append(boxed_section("Access", access))
-            story.append(Spacer(1, 0.12*inch))
-            story.append(boxed_section("Findings", findings))
-            story.append(Spacer(1, 0.2*inch))
+            for title, content in (("Scope", scope), ("Access", access), ("Findings", findings)):
+                block = boxed_section(title, content)
+                if block is not None:
+                    story.append(block)
+                    story.append(Spacer(1, 0.12*inch))
 
-            if show_signoff:
-                signoff_data = [[Paragraph("<b>Signoff</b>", styles["SectionHead"])],
+            if show_signoff and (signoff_name or "").strip():
+                signoff_data = [[Paragraph("Signoff", box_title)],
                                 [Paragraph(signoff_name, styles["BodyJust"])]]
                 signoff_t = Table(signoff_data, colWidths=[3*inch])
                 signoff_t.setStyle(TableStyle([
@@ -349,17 +548,20 @@ if st.button("Generate Customized Report PDF", type="primary"):
                     ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
                 ]))
                 story.append(signoff_t)
-            story.append(PageBreak())
+
+            has_images = bool(image_metadata or ba_pairs)
+            if show_summary or has_images:
+                story.append(PageBreak())
 
             # Summary
             if show_summary:
                 total_std = len(image_metadata)
                 total_ba = len(ba_pairs)
                 summary_data = [
-                    [Paragraph("<b>Inspection Summary</b>", styles["SectionHead"]), "", ""],
+                    [Paragraph("<b>Inspection Summary</b>", styles["BodyJust"]), "", ""],
                     [Paragraph("<b>Category</b>", styles["BodyJust"]), Paragraph("<b>Count</b>", styles["BodyJust"]), Paragraph("<b>Notes</b>", styles["BodyJust"])],
-                    ["Standard Images", str(total_std), "See findings and image pages"],
-                    ["Before/After Pairs", str(total_ba), "Presented side-by-side"],
+                    ["Standard Images", str(total_std), "In filename order"],
+                    ["Before/After Pairs", str(total_ba), "Side-by-side"],
                 ]
                 t = Table(summary_data, colWidths=[2.5*inch, 1.2*inch, 2.6*inch])
                 t.setStyle(TableStyle([
@@ -375,18 +577,22 @@ if st.button("Generate Customized Report PDF", type="primary"):
                     ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
                 ]))
                 story.append(t)
-                story.append(PageBreak())
+                if has_images:
+                    story.append(PageBreak())
 
-            # Image pages
-            def make_image_block(img_file, label1, label2, comments, filename):
+            def jpeg_path(data):
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-                tmp.write(img_file.getvalue())
+                pil = PILImage.open(io.BytesIO(data))
+                if pil.mode not in ("RGB", "L"):
+                    pil = pil.convert("RGB")
+                pil.thumbnail((480, 360))
+                pil.save(tmp.name, "JPEG", quality=90)
                 tmp.close()
+                return tmp.name
+
+            def make_image_block(data, label1, label2, comments, filename):
                 try:
-                    pil = PILImage.open(tmp.name)
-                    pil.thumbnail((480, 360))
-                    pil.save(tmp.name, "JPEG", quality=90)
-                    img = Image(tmp.name, width=3.4*inch, height=2.55*inch)
+                    img = Image(jpeg_path(data), width=3.4*inch, height=2.55*inch)
                 except Exception:
                     img = Paragraph("[Image error]", styles["BodyJust"])
 
@@ -420,29 +626,29 @@ if st.button("Generate Customized Report PDF", type="primary"):
                 ])
 
             step = images_per_page
+            wrote_std = False
             for idx in range(0, len(image_metadata), step):
+                wrote_std = True
                 chunk = image_metadata[idx:idx+step]
                 for item in chunk:
                     story.append(make_image_block(
-                        item["file"], item["label1"], item["label2"], item["comments"], item["name"]
+                        item["bytes"], item["label1"], item["label2"], item["comments"], item["name"]
                     ))
                 if idx + step < len(image_metadata):
                     story.append(PageBreak())
 
-            # Before/After
-            for pair in ba_pairs:
-                story.append(PageBreak())
+            for i, pair in enumerate(ba_pairs):
+                if wrote_std or i > 0:
+                    story.append(PageBreak())
                 story.append(Paragraph(f"<b>{pair['label']}</b>", styles["SectionHead"]))
-                story.append(Spacer(1, 0.1*inch))
-                tmp_b = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-                tmp_b.write(pair["before"].getvalue())
-                tmp_b.close()
-                tmp_a = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-                tmp_a.write(pair["after"].getvalue())
-                tmp_a.close()
+                story.append(Paragraph(
+                    f"{pair['before_name']}  ·  {pair['after_name']}",
+                    styles["SmallCenter"],
+                ))
+                story.append(Spacer(1, 0.08*inch))
                 try:
-                    img_b = Image(tmp_b.name, width=3.3*inch, height=2.5*inch)
-                    img_a = Image(tmp_a.name, width=3.3*inch, height=2.5*inch)
+                    img_b = Image(jpeg_path(pair["before_bytes"]), width=3.3*inch, height=2.5*inch)
+                    img_a = Image(jpeg_path(pair["after_bytes"]), width=3.3*inch, height=2.5*inch)
                 except Exception:
                     img_b = Paragraph("Before", styles["BodyJust"])
                     img_a = Paragraph("After", styles["BodyJust"])
