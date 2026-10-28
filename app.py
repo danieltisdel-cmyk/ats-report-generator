@@ -176,7 +176,7 @@ def point_sort_key(img):
     info = parse_point(img.get("point") or "") or parse_point(img.get("name") or "")
     if not info:
         return ("zzz", 9999, "", natural_key(img.get("name") or ""))
-    return (info["kind"], info["num"], info["view"], natural_key(img.get("name") or ""))
+    return (info["num"], info["view"], natural_key(img.get("name") or ""))
 
 
 def add_images(items, role="standard"):
@@ -231,7 +231,7 @@ def images_from_zip(data):
 
 
 def match_sets(library, mode="point"):
-    """Pair older photos to new photos that share the same Pen or ICI number."""
+    """Pen and ICI are the same. Match the number and the degrees: Pen 1 0-90 with ICI 1 0-90."""
     befores = [img for img in library if img["role"] == "before"]
     afters = [img for img in library if img["role"] == "after"]
     befores.sort(key=point_sort_key)
@@ -239,7 +239,7 @@ def match_sets(library, mode="point"):
     buckets = {}
     for a in afters:
         info = parse_point(a.get("point") or "") or parse_point(a.get("name") or "")
-        key = (info["kind"], info["num"]) if info else None
+        key = (info["num"], info["view"]) if info else None
         buckets.setdefault(key, []).append(a)
     used = set()
     pairs = []
@@ -247,13 +247,9 @@ def match_sets(library, mode="point"):
         info = parse_point(b.get("point") or "") or parse_point(b.get("name") or "")
         if not info:
             continue
-        choices = [a for a in buckets.get((info["kind"], info["num"]), []) if a["id"] not in used]
+        choices = [a for a in buckets.get((info["num"], info["view"]), []) if a["id"] not in used]
         if not choices:
             continue
-        if info["view"]:
-            exact = [a for a in choices if (parse_point(a.get("point") or "") or {}).get("view") == info["view"]]
-            if exact:
-                choices = exact
         chosen = choices[0]
         used.add(chosen["id"])
         pairs.append((b, chosen))
@@ -396,8 +392,9 @@ st.markdown("---")
 st.subheader("Before and after — two inspections")
 st.caption(
     "Older inspection on the left, the one you just did on the right. "
-    "They stay separate. A before photo is matched to an after photo only when both say the same Pen or ICI number "
-    "(Pen 1 with Pen 1, ICI 4 with ICI 4). Photos with no match print by themselves at the end."
+    "Pen and ICI are interchangeable. Photos match on the number and the degrees: "
+    "Pen 1 0-90 sits beside ICI 1 0-90. A different degree is a different photo. "
+    "Anything that does not match prints by itself at the end."
 )
 
 col_b, col_a = st.columns(2)
@@ -478,7 +475,7 @@ def edit_set(images, empty_note, page_key):
             "Pen or ICI",
             value=img.get("point") or "",
             key=f"pt_{img['id']}",
-            placeholder="Pen 1 or ICI 3",
+            placeholder="Pen 1 0-90",
             label_visibility="collapsed",
         )
     if pages > 1:
@@ -527,10 +524,13 @@ if library:
         edit_set(sorted((img for img in library if img["role"] == "after"), key=point_sort_key), "No new photos yet.", "page_after")
 
     if pairs_preview:
-        st.markdown("**Matched by Pen / ICI**")
+        st.markdown("**Matched by number and degrees**")
         for b, a in pairs_preview:
-            label = b.get("point") or a.get("point") or "Pair"
-            st.write(f"{label}:  {b['name']}  ↔  {a['name']}")
+            info = parse_point(b.get("point") or "") or parse_point(a.get("point") or "") or {}
+            view = info.get("view") or ""
+            num = info.get("num")
+            tag = f"{num} {view}".strip() if num is not None else (b.get("point") or "Pair")
+            st.write(f"{tag}:  {b.get('point') or b['name']}  ↔  {a.get('point') or a['name']}")
     singles = [img for img in library if img["role"] == "standard"] + left_before + left_after
     if singles:
         st.markdown("**Single photos — these print at the end**")
@@ -549,12 +549,17 @@ if st.button("Generate Customized Report PDF", type="primary"):
         image_metadata.sort(key=point_sort_key)
         ba_pairs = []
         for b, a in paired:
+            info = parse_point(b.get("point") or "") or parse_point(a.get("point") or "") or {}
+            if info:
+                label = f"{info['num']}  {info['view']}".strip()
+            else:
+                label = b.get("point") or a.get("point") or "Before / After"
             ba_pairs.append({
                 "before_bytes": b["bytes"],
                 "after_bytes": a["bytes"],
-                "before_name": b["name"],
-                "after_name": a["name"],
-                "label": b.get("point") or a.get("point") or "Before / After",
+                "before_name": b.get("point") or b["name"],
+                "after_name": a.get("point") or a["name"],
+                "label": label,
                 "comments": " · ".join(x for x in (b.get("comments"), a.get("comments")) if x),
             })
         with st.spinner("Generating customized report..."):
