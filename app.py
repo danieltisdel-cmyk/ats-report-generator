@@ -132,23 +132,41 @@ def parse_point(text):
     return {"kind": kind.lower(), "num": num, "view": view.lower(), "label": label}
 
 
-def read_point(name, data):
+def read_point(name, data=None):
+    """Filename only. Scanning the picture itself is a separate button so uploads stay fast."""
     found = parse_point(name)
-    if found:
-        return found["label"]
+    return found["label"] if found else ""
+
+
+def shrink_photo(data, max_px=1200, quality=80):
+    """Smaller JPEG so a whole inspection folder does not freeze the page."""
+    im = PILImage.open(io.BytesIO(data))
+    im = im.convert("RGB")
+    im.thumbnail((max_px, max_px))
+    out = io.BytesIO()
+    im.save(out, "JPEG", quality=quality)
+    return out.getvalue()
+
+
+def thumb_photo(data):
+    im = PILImage.open(io.BytesIO(data))
+    im = im.convert("RGB")
+    im.thumbnail((280, 210))
+    out = io.BytesIO()
+    im.save(out, "JPEG", quality=65)
+    return out.getvalue()
+
+
+def ocr_banner(data):
+    """Read the Pen / ICI line Mentor prints along the top of the still."""
     try:
         import pytesseract
-        im = PILImage.open(io.BytesIO(data)).convert("RGB")
+        im = PILImage.open(io.BytesIO(data)).convert("L")
         w, h = im.size
-        crops = [
-            im.crop((0, 0, w, max(20, int(h * 0.14)))),
-            im.crop((0, 0, int(w * 0.5), max(20, int(h * 0.2)))),
-        ]
-        bits = []
-        for crop in crops:
-            crop = crop.resize((crop.width * 3, crop.height * 3))
-            bits.append(pytesseract.image_to_string(crop, config="--psm 6") or "")
-        found = parse_point(" ".join(bits))
+        strip = im.crop((0, 0, w, max(18, int(h * 0.12))))
+        strip = strip.resize((strip.width * 2, max(48, strip.height * 2)))
+        text = pytesseract.image_to_string(strip, config="--psm 6") or ""
+        found = parse_point(text)
         return found["label"] if found else ""
     except Exception:
         return ""
@@ -164,7 +182,7 @@ def point_sort_key(img):
 def add_images(items, role="standard"):
     """items: list of (name, bytes). Same filename may exist in before and after."""
     library = st.session_state.library
-    known = {(img["role"], img["name"], len(img["bytes"])) for img in library}
+    known = {(img["role"], img["name"]) for img in library}
     added = 0
     for name, data in items:
         base = os.path.basename(name.replace("\\", "/"))
@@ -172,20 +190,27 @@ def add_images(items, role="standard"):
         if ext not in IMAGE_EXTS or not data:
             continue
         use_role = role if role != "auto" else detect_role(base)
-        if (use_role, base, len(data)) in known:
+        if (use_role, base) in known:
             continue
+        try:
+            stored = shrink_photo(data)
+            thumb = thumb_photo(stored)
+        except Exception:
+            stored = data
+            thumb = data
         library.append({
             "id": uuid.uuid4().hex[:10],
             "name": base,
             "folder": os.path.dirname(name.replace("\\", "/")),
-            "bytes": data,
+            "bytes": stored,
+            "thumb": thumb,
             "label1": os.path.splitext(base)[0],
             "label2": "",
             "comments": "",
             "role": use_role,
-            "point": read_point(base, data),
+            "point": read_point(base),
         })
-        known.add((use_role, base, len(data)))
+        known.add((use_role, base))
         added += 1
     if added and not st.session_state.manual_order:
         library.sort(key=lambda img: (img["role"], natural_key(img["folder"] + "/" + img["name"])))
@@ -241,17 +266,28 @@ def match_sets(library, mode="point"):
 
 
 def files_from_upload(files):
+    """Read each dropped file once. Later clicks reuse what is already stored."""
     incoming = []
+    seen = st.session_state.seen_uploads
     for f in files or []:
+        fid = getattr(f, "file_id", None)
+        if not fid:
+            fid = f"{f.name}:{getattr(f, 'size', 0)}"
+        if fid in seen:
+            continue
+        raw = f.getvalue()
         if f.name.lower().endswith(".zip"):
-            incoming.extend(images_from_zip(f.getvalue()))
+            incoming.extend(images_from_zip(raw))
         else:
-            incoming.append((f.name, f.getvalue()))
+            incoming.append((f.name, raw))
+        seen.add(fid)
     return incoming
 
 
 if "library" not in st.session_state:
     st.session_state.library = []
+if "seen_uploads" not in st.session_state:
+    st.session_state.seen_uploads = set()
 if "manual_order" not in st.session_state:
     st.session_state.manual_order = False
 if "upload_nonce" not in st.session_state:
@@ -398,16 +434,19 @@ c1, c2, c3 = st.columns(3)
 with c1:
     if st.button("Clear older inspection"):
         st.session_state.library = [img for img in library if img["role"] != "before"]
+        st.session_state.seen_uploads = set()
         st.session_state.nonce_before += 1
         st.rerun()
 with c2:
     if st.button("Clear this inspection"):
         st.session_state.library = [img for img in library if img["role"] != "after"]
+        st.session_state.seen_uploads = set()
         st.session_state.nonce_after += 1
         st.rerun()
 with c3:
     if st.button("Clear all images"):
         st.session_state.library = []
+        st.session_state.seen_uploads = set()
         st.session_state.manual_order = False
         st.session_state.upload_nonce += 1
         st.session_state.nonce_before += 1
@@ -424,13 +463,17 @@ role_labels = {
 
 pairs_preview, left_before, left_after = match_sets(library, match_mode)
 
-def edit_set(images, empty_note):
+def edit_set(images, empty_note, page_key):
     if not images:
         st.caption(empty_note)
         return
-    for img in images:
-        tag = img.get("point") or "No Pen / ICI yet"
-        st.image(img["bytes"], width=240, caption=img["name"])
+    page_size = 6
+    pages = max(1, (len(images) + page_size - 1) // page_size)
+    page = min(st.session_state.get(page_key, 0), pages - 1)
+    st.session_state[page_key] = page
+    start = page * page_size
+    for img in images[start:start + page_size]:
+        st.image(img.get("thumb") or img["bytes"], width=220, caption=img["name"])
         img["point"] = st.text_input(
             "Pen or ICI",
             value=img.get("point") or "",
@@ -438,7 +481,17 @@ def edit_set(images, empty_note):
             placeholder="Pen 1 or ICI 3",
             label_visibility="collapsed",
         )
-        st.caption(tag if img.get("point") else "Type the Pen or ICI number if it was not picked up.")
+    if pages > 1:
+        a, b = st.columns(2)
+        with a:
+            if st.button("Previous", key=f"prev_{page_key}", disabled=page <= 0):
+                st.session_state[page_key] = page - 1
+                st.rerun()
+        with b:
+            if st.button("Next", key=f"next_{page_key}", disabled=page >= pages - 1):
+                st.session_state[page_key] = page + 1
+                st.rerun()
+        st.caption(f"Page {page + 1} of {pages}")
 
 if library:
     n_std = sum(1 for img in library if img["role"] == "standard")
@@ -449,17 +502,29 @@ if library:
     )
     if missing:
         st.warning(
-            f"{missing} photo(s) have no Pen or ICI number. Type it under the photo (example: Pen 1). "
-            "Those print alone at the end until they match."
+            f"{missing} photo(s) have no Pen or ICI number yet. "
+            "Click the button to read the number printed on the photo, 20 at a time, or type it under the photo."
         )
+        if st.button("Read Pen/ICI from the next 20 photos"):
+            todo = [img for img in library if img["role"] in ("before", "after") and not img.get("point")][:20]
+            found = 0
+            for img in todo:
+                label = ocr_banner(img["bytes"])
+                if label:
+                    img["point"] = label
+                    found += 1
+            st.session_state["ocr_note"] = f"Read {found} of {len(todo)}. Click again if some are still blank."
+            st.rerun()
+        if st.session_state.get("ocr_note"):
+            st.caption(st.session_state["ocr_note"])
 
     left_col, right_col = st.columns(2)
     with left_col:
         st.markdown(f"**Older inspection ({n_before})**")
-        edit_set(sorted((img for img in library if img["role"] == "before"), key=point_sort_key), "No older photos yet.")
+        edit_set(sorted((img for img in library if img["role"] == "before"), key=point_sort_key), "No older photos yet.", "page_before")
     with right_col:
         st.markdown(f"**This inspection ({n_after})**")
-        edit_set(sorted((img for img in library if img["role"] == "after"), key=point_sort_key), "No new photos yet.")
+        edit_set(sorted((img for img in library if img["role"] == "after"), key=point_sort_key), "No new photos yet.", "page_after")
 
     if pairs_preview:
         st.markdown("**Matched by Pen / ICI**")
