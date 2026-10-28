@@ -260,36 +260,41 @@ if include_client_logo:
 
 st.markdown("---")
 st.subheader("Images")
-st.caption("Drop a whole folder as a .zip, or select many photos at once. They sort by the numbers in the filename (2 before 10) and stay in that order.")
+st.caption(
+    "One box for everything. Select a bunch of photos, or a .zip of the folder. "
+    "They line up by the number in the filename (2 before 10)."
+)
 
-up1, up2 = st.columns(2)
-with up1:
-    uploaded_images = st.file_uploader(
-        "Images — select as many as you want",
-        type=["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff"],
-        accept_multiple_files=True,
-        key=f"std_images_{st.session_state.upload_nonce}",
-    )
-with up2:
-    uploaded_zips = st.file_uploader(
-        "Or a .zip of the whole folder",
-        type=["zip"],
-        accept_multiple_files=True,
-        key=f"zip_images_{st.session_state.upload_nonce}",
-    )
+uploaded_files = st.file_uploader(
+    "Photos or a .zip",
+    type=["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "zip"],
+    accept_multiple_files=True,
+    key=f"uploads_{st.session_state.upload_nonce}",
+    help="On a computer, hold Ctrl or Shift to pick many photos. A .zip is the easy way to send a whole Mentor folder.",
+)
 
 incoming = []
-if uploaded_images:
-    incoming.extend((f.name, f.getvalue()) for f in uploaded_images)
-if uploaded_zips:
-    for z in uploaded_zips:
-        incoming.extend(images_from_zip(z.getvalue()))
+if uploaded_files:
+    for f in uploaded_files:
+        if f.name.lower().endswith(".zip"):
+            incoming.extend(images_from_zip(f.getvalue()))
+        else:
+            incoming.append((f.name, f.getvalue()))
 if incoming:
     added = add_images(incoming)
     if added:
         st.session_state.img_page = 0
 
 library = st.session_state.library
+
+
+def pair_every_two(items):
+    active = [img for img in items if img["role"] != "skip"]
+    for i, img in enumerate(active):
+        leftover = (i == len(active) - 1) and (len(active) % 2 == 1)
+        img["role"] = "standard" if leftover else ("before" if i % 2 == 0 else "after")
+
+
 b1, b2, b3, b4 = st.columns(4)
 with b1:
     if st.button("Sort by filename"):
@@ -297,14 +302,14 @@ with b1:
         st.session_state.manual_order = False
         st.rerun()
 with b2:
-    if st.button("Tag before/after from names"):
-        for img in library:
-            img["role"] = detect_role(img["name"])
+    if st.button("Pair 1 before, 2 after"):
+        pair_every_two(library)
         st.rerun()
 with b3:
-    if st.button("Mark all standard"):
+    if st.button("Clear pairs"):
         for img in library:
-            img["role"] = "standard"
+            if img["role"] in ("before", "after"):
+                img["role"] = "standard"
         st.rerun()
 with b4:
     if st.button("Clear all images"):
@@ -314,8 +319,15 @@ with b4:
         st.session_state.img_page = 0
         st.rerun()
 
+st.caption(
+    "No before/after on this job? Do nothing — every photo prints in order. "
+    "Need before/after? Put the before shot just above its after shot, then click **Pair 1 before, 2 after**. "
+    "Photo 1 sits beside photo 2, photo 3 beside photo 4, and so on. "
+    "If the filename already says before or after, that is picked up on upload."
+)
+
 role_labels = {
-    "standard": "In report",
+    "standard": "In the report",
     "before": "Before",
     "after": "After",
     "skip": "Leave out",
@@ -324,7 +336,7 @@ role_labels = {
 if library:
     n_std = sum(1 for img in library if img["role"] == "standard")
     pairs_preview = build_pairs(library)
-    st.info(f"{len(library)} images loaded · {n_std} in order · {len(pairs_preview)} before/after pair(s).")
+    st.info(f"{len(library)} images · {n_std} printed alone · {len(pairs_preview)} side-by-side pair(s).")
 
     query = st.text_input("Find an image", placeholder="Type part of a filename")
     shown = [img for img in library if not query or query.lower() in img["name"].lower() or query.lower() in (img.get("folder") or "").lower()]
@@ -378,12 +390,14 @@ if library:
                         library.pop(idx)
                         st.rerun()
 
+    st.markdown("**Side-by-side pairs**")
     if pairs_preview:
-        st.markdown("**Before/after pairs that will sit side by side**")
-        for b, a in pairs_preview:
-            st.write(f"{b['name']}  →  {a['name']}")
+        for n, (b, a) in enumerate(pairs_preview, start=1):
+            st.write(f"{n}. Before: {b['name']}  ·  After: {a['name']}")
+    else:
+        st.write("None yet. Photos will print one after another.")
 else:
-    st.info("No images yet. Select a batch of photos, or zip the Mentor folder and upload the .zip.")
+    st.info("No images yet. Add photos or a .zip above.")
 
 # Generate PDF
 if st.button("Generate Customized Report PDF", type="primary"):
