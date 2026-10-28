@@ -105,17 +105,34 @@ def pair_key(name):
     return stem
 
 
-def add_images(items):
-    """items: list of (name, bytes). Skips duplicates and non-images."""
+def clean_stem(name):
+    stem = os.path.splitext(os.path.basename(name or ""))[0].lower()
+    stem = re.sub(r"(before|after|pre|post|bef|aft|b4)", " ", stem)
+    stem = re.sub(r"\b(19|20)\d{2}\b", " ", stem)
+    stem = re.sub(r"\b\d{8}\b", " ", stem)
+    stem = re.sub(r"\b\d{1,2}[-_]\d{1,2}[-_]\d{2,4}\b", " ", stem)
+    stem = re.sub(r"[^a-z0-9]+", " ", stem)
+    return re.sub(r"\s+", " ", stem).strip()
+
+
+def last_number(name):
+    stem = re.sub(r"\b(19|20)\d{2}\b", " ", os.path.splitext(os.path.basename(name or ""))[0])
+    nums = re.findall(r"\d+", stem)
+    return int(nums[-1]) if nums else None
+
+
+def add_images(items, role="standard"):
+    """items: list of (name, bytes). Same filename may exist in before and after."""
     library = st.session_state.library
-    known = {(img["name"], len(img["bytes"])) for img in library}
+    known = {(img["role"], img["name"], len(img["bytes"])) for img in library}
     added = 0
     for name, data in items:
         base = os.path.basename(name.replace("\\", "/"))
         ext = os.path.splitext(base)[1].lower()
         if ext not in IMAGE_EXTS or not data:
             continue
-        if (base, len(data)) in known:
+        use_role = role if role != "auto" else detect_role(base)
+        if (use_role, base, len(data)) in known:
             continue
         library.append({
             "id": uuid.uuid4().hex[:10],
@@ -125,12 +142,12 @@ def add_images(items):
             "label1": os.path.splitext(base)[0],
             "label2": "",
             "comments": "",
-            "role": detect_role(base),
+            "role": use_role,
         })
-        known.add((base, len(data)))
+        known.add((use_role, base, len(data)))
         added += 1
     if added and not st.session_state.manual_order:
-        library.sort(key=lambda img: natural_key(img["folder"] + "/" + img["name"]))
+        library.sort(key=lambda img: (img["role"], natural_key(img["folder"] + "/" + img["name"])))
     return added
 
 
@@ -147,25 +164,54 @@ def images_from_zip(data):
     return found
 
 
-def build_pairs(library):
+def match_sets(library, mode):
+    """Pair the older inspection (before) with this inspection (after)."""
     befores = [img for img in library if img["role"] == "before"]
     afters = [img for img in library if img["role"] == "after"]
-    used_after = set()
+    befores.sort(key=lambda img: natural_key(img["name"]))
+    afters.sort(key=lambda img: natural_key(img["name"]))
+    used = set()
     pairs = []
-    for b in befores:
-        key = pair_key(b["name"])
-        match = next((a for a in afters if a["id"] not in used_after and pair_key(a["name"]) == key), None)
-        if match is None:
-            bnums = re.findall(r"\d+", b["name"])
-            if bnums:
-                match = next(
-                    (a for a in afters if a["id"] not in used_after and bnums[-1] in re.findall(r"\d+", a["name"])),
-                    None,
-                )
-        if match is not None:
-            used_after.add(match["id"])
-            pairs.append((b, match))
-    return pairs
+
+    def take(after_img):
+        used.add(after_img["id"])
+        return after_img
+
+    if mode == "order":
+        for b, a in zip(befores, afters):
+            pairs.append((b, take(a)))
+    else:
+        if mode == "number":
+            buckets = {}
+            for a in afters:
+                buckets.setdefault(last_number(a["name"]), []).append(a)
+            def key_of(img):
+                return last_number(img["name"])
+        else:
+            buckets = {}
+            for a in afters:
+                buckets.setdefault(clean_stem(a["name"]), []).append(a)
+            def key_of(img):
+                return clean_stem(img["name"])
+        for b in befores:
+            choices = [a for a in buckets.get(key_of(b), []) if a["id"] not in used]
+            if choices:
+                pairs.append((b, take(choices[0])))
+    paired_b = {b["id"] for b, _ in pairs}
+    paired_a = {a["id"] for _, a in pairs}
+    left_b = [b for b in befores if b["id"] not in paired_b]
+    left_a = [a for a in afters if a["id"] not in paired_a]
+    return pairs, left_b, left_a
+
+
+def files_from_upload(files):
+    incoming = []
+    for f in files or []:
+        if f.name.lower().endswith(".zip"):
+            incoming.extend(images_from_zip(f.getvalue()))
+        else:
+            incoming.append((f.name, f.getvalue()))
+    return incoming
 
 
 if "library" not in st.session_state:
@@ -174,6 +220,10 @@ if "manual_order" not in st.session_state:
     st.session_state.manual_order = False
 if "upload_nonce" not in st.session_state:
     st.session_state.upload_nonce = 0
+if "nonce_before" not in st.session_state:
+    st.session_state.nonce_before = 0
+if "nonce_after" not in st.session_state:
+    st.session_state.nonce_after = 0
 if "img_page" not in st.session_state:
     st.session_state.img_page = 0
 
@@ -259,87 +309,126 @@ if include_client_logo:
             f.write(client_logo_file.getvalue())
 
 st.markdown("---")
-st.subheader("Images")
-st.caption(
-    "One box for everything. Select a bunch of photos, or a .zip of the folder. "
-    "They line up by the number in the filename (2 before 10)."
-)
+st.subheader("Images for this report")
+st.caption("Photos that are not a before/after. Select many, or drop a .zip. They print in filename order.")
 
-uploaded_files = st.file_uploader(
-    "Photos or a .zip",
+report_files = st.file_uploader(
+    "Report photos or a .zip",
     type=["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "zip"],
     accept_multiple_files=True,
     key=f"uploads_{st.session_state.upload_nonce}",
-    help="On a computer, hold Ctrl or Shift to pick many photos. A .zip is the easy way to send a whole Mentor folder.",
+)
+added_report = add_images(files_from_upload(report_files), role="standard") if report_files else 0
+
+st.markdown("---")
+st.subheader("Before and after — two inspections")
+st.caption(
+    "Put the older inspection on the left and the one you just did on the right. "
+    "Each box takes a whole set of photos or a .zip. They are matched across the two sets, not mixed into one list."
 )
 
-incoming = []
-if uploaded_files:
-    for f in uploaded_files:
-        if f.name.lower().endswith(".zip"):
-            incoming.extend(images_from_zip(f.getvalue()))
-        else:
-            incoming.append((f.name, f.getvalue()))
-if incoming:
-    added = add_images(incoming)
-    if added:
-        st.session_state.img_page = 0
+col_b, col_a = st.columns(2)
+with col_b:
+    st.markdown("**Older inspection (before)**")
+    before_files = st.file_uploader(
+        "Before photos or a .zip",
+        type=["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "zip"],
+        accept_multiple_files=True,
+        key=f"before_up_{st.session_state.nonce_before}",
+    )
+with col_a:
+    st.markdown("**This inspection (after)**")
+    after_files = st.file_uploader(
+        "After photos or a .zip",
+        type=["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "zip"],
+        accept_multiple_files=True,
+        key=f"after_up_{st.session_state.nonce_after}",
+    )
+
+if before_files:
+    add_images(files_from_upload(before_files), role="before")
+if after_files:
+    add_images(files_from_upload(after_files), role="after")
+if added_report:
+    st.session_state.img_page = 0
 
 library = st.session_state.library
+n_before = sum(1 for img in library if img["role"] == "before")
+n_after = sum(1 for img in library if img["role"] == "after")
 
+if "match_mode" not in st.session_state:
+    st.session_state.match_mode = "name"
 
-def pair_every_two(items):
-    active = [img for img in items if img["role"] != "skip"]
-    for i, img in enumerate(active):
-        leftover = (i == len(active) - 1) and (len(active) % 2 == 1)
-        img["role"] = "standard" if leftover else ("before" if i % 2 == 0 else "after")
+if n_before and n_after:
+    match_mode = st.radio(
+        "Line the two inspections up by",
+        ["name", "number", "order"],
+        format_func=lambda m: {
+            "name": "Same name (years and dates ignored)",
+            "number": "Same number in the filename",
+            "order": "Same order — 1st with 1st, 2nd with 2nd",
+        }[m],
+        horizontal=True,
+        key="match_mode",
+    )
+else:
+    match_mode = st.session_state.match_mode
 
-
-b1, b2, b3, b4 = st.columns(4)
-with b1:
-    if st.button("Sort by filename"):
-        library.sort(key=lambda img: natural_key(img["folder"] + "/" + img["name"]))
-        st.session_state.manual_order = False
+c1, c2, c3 = st.columns(3)
+with c1:
+    if st.button("Clear older inspection"):
+        st.session_state.library = [img for img in library if img["role"] != "before"]
+        st.session_state.nonce_before += 1
         st.rerun()
-with b2:
-    if st.button("Pair 1 before, 2 after"):
-        pair_every_two(library)
+with c2:
+    if st.button("Clear this inspection"):
+        st.session_state.library = [img for img in library if img["role"] != "after"]
+        st.session_state.nonce_after += 1
         st.rerun()
-with b3:
-    if st.button("Clear pairs"):
-        for img in library:
-            if img["role"] in ("before", "after"):
-                img["role"] = "standard"
-        st.rerun()
-with b4:
+with c3:
     if st.button("Clear all images"):
         st.session_state.library = []
         st.session_state.manual_order = False
         st.session_state.upload_nonce += 1
+        st.session_state.nonce_before += 1
+        st.session_state.nonce_after += 1
         st.session_state.img_page = 0
         st.rerun()
 
-st.caption(
-    "No before/after on this job? Do nothing — every photo prints in order. "
-    "Need before/after? Put the before shot just above its after shot, then click **Pair 1 before, 2 after**. "
-    "Photo 1 sits beside photo 2, photo 3 beside photo 4, and so on. "
-    "If the filename already says before or after, that is picked up on upload."
-)
-
 role_labels = {
     "standard": "In the report",
-    "before": "Before",
-    "after": "After",
+    "before": "Older inspection",
+    "after": "This inspection",
     "skip": "Leave out",
 }
 
+pairs_preview, left_before, left_after = match_sets(library, match_mode)
+
 if library:
     n_std = sum(1 for img in library if img["role"] == "standard")
-    pairs_preview = build_pairs(library)
-    st.info(f"{len(library)} images · {n_std} printed alone · {len(pairs_preview)} side-by-side pair(s).")
+    st.info(
+        f"Older: {n_before} · This inspection: {n_after} · Other photos: {n_std} · "
+        f"Side-by-side pairs: {len(pairs_preview)}"
+    )
+    if n_before and n_after and (left_before or left_after):
+        st.warning(
+            f"{len(left_before)} older photo(s) and {len(left_after)} new photo(s) did not line up. "
+            "Try another match option above. Unmatched photos print by themselves."
+        )
+
+    if pairs_preview:
+        st.markdown("**How they will sit on the page**")
+        for n, (b, a) in enumerate(pairs_preview[:8], start=1):
+            p1, p2 = st.columns(2)
+            with p1:
+                st.image(b["bytes"], width=260, caption=f"Before {n}: {b['name']}")
+            with p2:
+                st.image(a["bytes"], width=260, caption=f"After {n}: {a['name']}")
+        if len(pairs_preview) > 8:
+            st.caption(f"Plus {len(pairs_preview) - 8} more pairs.")
 
     query = st.text_input("Find an image", placeholder="Type part of a filename")
-    shown = [img for img in library if not query or query.lower() in img["name"].lower() or query.lower() in (img.get("folder") or "").lower()]
+    shown = [img for img in library if not query or query.lower() in img["name"].lower()]
 
     page_size = 12
     pages = max(1, (len(shown) + page_size - 1) // page_size)
@@ -357,9 +446,9 @@ if library:
             st.rerun()
 
     start = st.session_state.img_page * page_size
-    for offset, img in enumerate(shown[start:start + page_size]):
+    for img in shown[start:start + page_size]:
         idx = library.index(img)
-        with st.expander(f"{idx + 1}. {img['name']}  —  {role_labels.get(img['role'], img['role'])}", expanded=False):
+        with st.expander(f"{role_labels.get(img['role'], img['role'])}: {img['name']}", expanded=False):
             left, right = st.columns([1, 2])
             with left:
                 st.image(img["bytes"], width=220)
@@ -374,30 +463,11 @@ if library:
                 img["label1"] = st.text_input("Label 1", value=img["label1"], key=f"l1_{img['id']}")
                 img["label2"] = st.text_input("Label 2", value=img["label2"], key=f"l2_{img['id']}")
                 img["comments"] = st.text_input("Comments", value=img["comments"], key=f"c_{img['id']}")
-                m1, m2, m3 = st.columns(3)
-                with m1:
-                    if st.button("Move up", key=f"up_{img['id']}", disabled=idx == 0):
-                        library[idx - 1], library[idx] = library[idx], library[idx - 1]
-                        st.session_state.manual_order = True
-                        st.rerun()
-                with m2:
-                    if st.button("Move down", key=f"dn_{img['id']}", disabled=idx >= len(library) - 1):
-                        library[idx + 1], library[idx] = library[idx], library[idx + 1]
-                        st.session_state.manual_order = True
-                        st.rerun()
-                with m3:
-                    if st.button("Remove", key=f"rm_{img['id']}"):
-                        library.pop(idx)
-                        st.rerun()
-
-    st.markdown("**Side-by-side pairs**")
-    if pairs_preview:
-        for n, (b, a) in enumerate(pairs_preview, start=1):
-            st.write(f"{n}. Before: {b['name']}  ·  After: {a['name']}")
-    else:
-        st.write("None yet. Photos will print one after another.")
+                if st.button("Remove", key=f"rm_{img['id']}"):
+                    library.pop(idx)
+                    st.rerun()
 else:
-    st.info("No images yet. Add photos or a .zip above.")
+    st.info("No images yet. Add report photos, or the two inspections above.")
 
 # Generate PDF
 if st.button("Generate Customized Report PDF", type="primary"):
@@ -405,15 +475,21 @@ if st.button("Generate Customized Report PDF", type="primary"):
         st.error("Please fill in at least Client Name and Inspection Title.")
     else:
         library = st.session_state.library
-        image_metadata = [img for img in library if img["role"] == "standard"]
+        mode = st.session_state.get("match_mode", "name")
+        paired, left_b, left_a = match_sets(library, mode)
+        paired_ids = {b["id"] for b, _a in paired} | {a["id"] for _b, a in paired}
+        image_metadata = [
+            img for img in library
+            if img["role"] == "standard" or (img["id"] not in paired_ids and img["role"] in ("before", "after"))
+        ]
         ba_pairs = []
-        for b, a in build_pairs(library):
+        for b, a in paired:
             ba_pairs.append({
                 "before_bytes": b["bytes"],
                 "after_bytes": a["bytes"],
                 "before_name": b["name"],
                 "after_name": a["name"],
-                "label": b["label1"] or pair_key(b["name"]) or "Before / After",
+                "label": b["label1"] or clean_stem(b["name"]) or "Before / After",
                 "comments": " · ".join(x for x in (b["comments"], a["comments"]) if x),
             })
         with st.spinner("Generating customized report..."):
