@@ -65,6 +65,52 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOGO = os.path.join(SCRIPT_DIR, "ats_logo.jpg")
 
 
+def prepare_logo(src_path, max_px=1000):
+    """Trim the empty border around an uploaded logo and keep its real shape."""
+    im = PILImage.open(src_path).convert("RGBA")
+    white = PILImage.new("RGBA", im.size, (255, 255, 255, 255))
+    rgb = PILImage.alpha_composite(white, im).convert("RGB")
+    w, h = rgb.size
+    pix = rgb.load()
+    step = max(1, min(w, h) // 300)
+    minx, miny, maxx, maxy = w, h, 0, 0
+    for y in range(0, h, step):
+        for x in range(0, w, step):
+            r, g, b = pix[x, y]
+            if r < 245 or g < 245 or b < 245:
+                minx = min(minx, x)
+                miny = min(miny, y)
+                maxx = max(maxx, x)
+                maxy = max(maxy, y)
+    if maxx > minx and maxy > miny:
+        pad = int(max(w, h) * 0.03)
+        rgb = rgb.crop((
+            max(0, minx - pad),
+            max(0, miny - pad),
+            min(w, maxx + pad),
+            min(h, maxy + pad),
+        ))
+    rgb.thumbnail((max_px, max_px))
+    out = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    rgb.save(out.name, "JPEG", quality=92)
+    out.close()
+    return out.name, rgb.width, rgb.height
+
+
+def logo_flowable(path, max_w, max_h):
+    fitted, w, h = prepare_logo(path)
+    aspect = w / float(h or 1)
+    if max_w / aspect <= max_h:
+        draw_w = max_w
+        draw_h = max_w / aspect
+    else:
+        draw_h = max_h
+        draw_w = max_h * aspect
+    img = Image(fitted, width=draw_w, height=draw_h)
+    img.hAlign = "CENTER"
+    return img
+
+
 def ensure_default_logo():
     """Write the bundled ATS logo if it is not already on disk."""
     if os.path.exists(DEFAULT_LOGO):
@@ -409,6 +455,7 @@ with c1:
 with c2:
     accent_color = st.color_picker("Accent Color", "#1a365d")
     include_client_logo = st.checkbox("Add client logo on cover", value=False)
+    st.caption("The logo keeps its own shape. It is not stretched.")
 with c3:
     photo_layout = st.selectbox(
         "Regular photo layout",
@@ -669,6 +716,21 @@ def build_docx(meta, images, pairs):
         return p
 
     centered(meta["company"], 16, True)
+    for key, max_w in (("company_logo", 3.1), ("client_logo", 3.2)):
+        path = meta.get(key)
+        if path and os.path.exists(path):
+            try:
+                fitted, w, h = prepare_logo(path)
+                aspect = w / float(h or 1)
+                width = min(max_w, max_w if aspect >= 1 else max_w)
+                # cap height at 1.7 inches
+                if width / aspect > 1.7:
+                    width = 1.7 * aspect
+                p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                p.add_run().add_picture(fitted, width=Inches(width))
+            except Exception:
+                pass
     centered(meta["client"], 14, True)
     if meta.get("site"):
         centered(meta["site"], 11)
@@ -811,24 +873,20 @@ if st.button("Generate PDF and Word", type="primary"):
             story = []
 
             # Cover
-            story.append(Spacer(1, 0.3*inch))
+            story.append(Spacer(1, 0.35*inch))
             if logo_path and os.path.exists(logo_path):
                 try:
-                    logo = Image(logo_path, width=3.0*inch, height=0.95*inch)
-                    logo.hAlign = "CENTER"
-                    story.append(logo)
+                    story.append(logo_flowable(logo_path, 3.1*inch, 1.05*inch))
                 except Exception:
                     story.append(Paragraph(company_name, styles["CoverTitle"]))
             else:
                 story.append(Paragraph(company_name, styles["CoverTitle"]))
 
             if client_logo_path and os.path.exists(client_logo_path):
-                story.append(Spacer(1, 0.2*inch))
+                story.append(Spacer(1, 0.25*inch))
                 try:
-                    clogo = Image(client_logo_path, width=1.8*inch, height=0.7*inch)
-                    clogo.hAlign = "CENTER"
-                    story.append(clogo)
-                except:
+                    story.append(logo_flowable(client_logo_path, 3.2*inch, 1.7*inch))
+                except Exception:
                     pass
 
             story.append(Spacer(1, 0.15*inch))
@@ -1087,6 +1145,8 @@ if st.button("Generate PDF and Word", type="primary"):
             word_bytes = build_docx(
                 {
                     "company": company_name,
+                    "company_logo": logo_path if logo_path and os.path.exists(logo_path) else "",
+                    "client_logo": client_logo_path or "",
                     "client": client_name,
                     "site": site_location,
                     "title": inspection_title,
