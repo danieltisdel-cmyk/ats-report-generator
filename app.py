@@ -241,15 +241,21 @@ def point_sort_key(img):
 
 
 def point_info(img):
-    """Number and degrees only. Filename first, because it matches the top-left stamp."""
-    info = parse_point(img.get("name") or "")
-    if not info or not info.get("view"):
-        typed = parse_point(img.get("point") or "")
-        if typed and typed.get("view"):
-            info = typed
-    if info and info.get("view"):
-        img["point"] = info["label"]
-    return info
+    """Number and degrees. A typed value wins over the filename so it can be corrected."""
+    typed = parse_point(img.get("point") or "")
+    named = parse_point(img.get("name") or "")
+    if typed and typed.get("view"):
+        return typed
+    if named and named.get("view") and not (img.get("point") or "").strip():
+        img["point"] = named["label"]
+    return named if named and named.get("view") else typed
+
+
+def shown_label(img):
+    """Hide the raw filename when it was only a placeholder in Label 1."""
+    stem = os.path.splitext(img.get("name") or "")[0]
+    value = (img.get("label1") or "").strip()
+    return "" if value == stem else value
 
 
 def add_images(items, role="standard"):
@@ -314,8 +320,8 @@ def match_sets(library, mode="point"):
     """Pen and ICI match on the number and the degree range. Pen6_0-90 pairs with ICI_6_0-90."""
     for img in library:
         point_info(img)
-    befores = [img for img in library if img["role"] == "before"]
-    afters = [img for img in library if img["role"] == "after"]
+    befores = [img for img in library if img["role"] == "before" and not img.get("skip")]
+    afters = [img for img in library if img["role"] == "after" and not img.get("skip")]
     befores.sort(key=point_sort_key)
     afters.sort(key=point_sort_key)
     buckets = {}
@@ -620,15 +626,18 @@ def edit_set(images, empty_note, page_key):
     start = page * page_size
     for img in images[start:start + page_size]:
         st.image(img.get("thumb") or img["bytes"], width=220, caption=img["name"])
-        shown = (point_info(img) or {}).get("label") or "No number and angle in the name"
-        st.caption(shown)
-        img["point"] = st.text_input(
-            "Number and degrees",
-            value=img.get("point") or "",
-            key=f"pt_{img['id']}",
-            placeholder="6 0-90",
-            label_visibility="collapsed",
-        )
+        shown = (point_info(img) or {}).get("label") or "No number and angle"
+        with st.expander(f"{shown}  ·  edit", expanded=False):
+            img["point"] = st.text_input(
+                "Number and degrees",
+                value=img.get("point") or "",
+                key=f"pt_{img['id']}",
+                placeholder="6 0-90",
+            )
+            img["label1"] = st.text_input("Label 1", value=shown_label(img), key=f"bl1_{img['id']}")
+            img["label2"] = st.text_input("Label 2", value=img.get("label2") or "", key=f"bl2_{img['id']}")
+            img["comments"] = st.text_area("Comments", value=img.get("comments") or "", key=f"bc_{img['id']}", height=70)
+            img["skip"] = st.checkbox("Leave this photo out of the report", value=bool(img.get("skip")), key=f"bsk_{img['id']}")
     if pages > 1:
         a, b = st.columns(2)
         with a:
@@ -673,9 +682,11 @@ if library:
     with left_col:
         st.markdown(f"**Older inspection ({n_before})**")
         edit_set(sorted((img for img in library if img["role"] == "before"), key=point_sort_key), "No older photos yet.", "page_before")
+        st.caption("Open a photo to change the number, Label 1, Label 2, comments, or leave it out.")
     with right_col:
         st.markdown(f"**This inspection ({n_after})**")
         edit_set(sorted((img for img in library if img["role"] == "after"), key=point_sort_key), "No new photos yet.", "page_after")
+        st.caption("Open a photo to change the number, Label 1, Label 2, comments, or leave it out.")
 
     if pairs_preview:
         st.markdown("**Matched by number and degrees**")
@@ -781,6 +792,16 @@ def build_docx(meta, images, pairs):
                 table.rows[1].cells[col].paragraphs[0].add_run().add_picture(io.BytesIO(pair[key]), width=Inches(3.3))
             cap = doc.add_paragraph(f"{pair['before_name']}    {pair['after_name']}")
             cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for side, title in (("before", "Before"), ("after", "After")):
+                bits = []
+                if pair.get(f"{side}_label1"):
+                    bits.append(f"Label1: {pair[f'{side}_label1']}")
+                if pair.get(f"{side}_label2"):
+                    bits.append(f"Label2: {pair[f'{side}_label2']}")
+                if pair.get(f"{side}_comments"):
+                    bits.append(f"Comments: {pair[f'{side}_comments']}")
+                if bits:
+                    doc.add_paragraph(title + " — " + "  |  ".join(bits))
 
     for idx, item in enumerate(images):
         if idx == 0 or idx % 2 == 0:
@@ -817,6 +838,12 @@ if st.button("Generate PDF and Word", type="primary"):
                 "before_name": b["name"],
                 "after_name": a["name"],
                 "label": label,
+                "before_label1": shown_label(b),
+                "before_label2": b.get("label2") or "",
+                "before_comments": b.get("comments") or "",
+                "after_label1": shown_label(a),
+                "after_label2": a.get("label2") or "",
+                "after_comments": a.get("comments") or "",
                 "comments": " · ".join(x for x in (b.get("comments"), a.get("comments")) if x),
             })
         with st.spinner("Generating PDF and Word..."):
@@ -1081,9 +1108,29 @@ if st.button("Generate PDF and Word", type="primary"):
                     ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
                 ]))
                 story.append(ba_table)
-                if pair["comments"]:
-                    story.append(Spacer(1, 0.06*inch))
-                    story.append(Paragraph(f"<b>Comments:</b> {pair['comments']}", styles["BodyJust"]))
+                def side_note(label1, label2, comments):
+                    bits = []
+                    if label1:
+                        bits.append(f"<b>Label1:</b> {label1}")
+                    if label2:
+                        bits.append(f"<b>Label2:</b> {label2}")
+                    if comments:
+                        bits.append(f"<b>Comments:</b> {comments}")
+                    return "<br/>".join(bits)
+                left_note = side_note(pair.get("before_label1"), pair.get("before_label2"), pair.get("before_comments"))
+                right_note = side_note(pair.get("after_label1"), pair.get("after_label2"), pair.get("after_comments"))
+                if left_note or right_note:
+                    notes = Table(
+                        [[Paragraph(left_note, styles["BodyJust"]), Paragraph(right_note, styles["BodyJust"])]],
+                        colWidths=[3.4*inch, 3.4*inch],
+                    )
+                    notes.setStyle(TableStyle([
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                        ("TOPPADDING", (0, 0), (-1, -1), 3),
+                    ]))
+                    story.append(notes)
                 story.append(Spacer(1, 0.12*inch))
 
             if image_metadata:
